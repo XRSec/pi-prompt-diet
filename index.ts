@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -220,12 +220,25 @@ function mergeConfig(base: PromptDietConfig, next: PromptDietConfig): PromptDiet
 	};
 }
 
+const configCache = new Map<string, { mtimeKey: string; config: PromptDietConfig }>();
+
+function configMtimeKey(paths: string[]): string {
+	return paths
+		.filter((path) => existsSync(path))
+		.map((path) => `${path}:${statSync(path).mtimeMs}`)
+		.join("|");
+}
+
 function loadConfig(cwd: string): PromptDietConfig {
 	const userConfigDir = join(homedir(), ".pi", "agent");
 	const primaryUserConfigPath = join(userConfigDir, "pi-prompt-diet.json");
 	const legacyUserConfigPath = join(userConfigDir, "prompt-diet.json");
 	const projectConfigPath = join(cwd, ".pi", "pi-prompt-diet.json");
 	const legacyProjectConfigPath = join(cwd, ".pi", "prompt-diet.json");
+	const configPaths = [legacyUserConfigPath, primaryUserConfigPath, legacyProjectConfigPath, projectConfigPath];
+	const cacheKey = `${cwd}::${configMtimeKey(configPaths)}`;
+	const cached = configCache.get(cacheKey);
+	if (cached) return cached.config;
 
 	// 1. 如果用户全局配置不存在，自动创建标准的默认配置文件
 	if (!existsSync(primaryUserConfigPath) && !existsSync(legacyUserConfigPath)) {
@@ -254,6 +267,7 @@ function loadConfig(cwd: string): PromptDietConfig {
 			} catch {}
 		}
 	}
+	configCache.set(cacheKey, { mtimeKey: cacheKey, config });
 	return config;
 }
 
@@ -635,12 +649,28 @@ export default function promptDiet(pi: ExtensionAPI) {
 
 		const routePrompt = routingIntent(event.prompt);
 		const pureContinuation = isPureContinuation(routePrompt);
-		const shouldRoute = config.adaptive?.enabled !== false && (
+		const routeEveryTurn = config.adaptive?.routeEveryTurn === true;
+		const configuredAlwaysTools = (config.adaptive?.alwaysTools ?? []).filter((name) => registeredTools.has(name));
+		// When alwaysTools is set and per-turn routing is off, skip the blocking router LLM entirely.
+		const fastStart = !routeEveryTurn && configuredAlwaysTools.length > 0;
+		const shouldRoute = config.adaptive?.enabled !== false && !fastStart && (
 			!capabilityState.firstRouteCompleted
 			|| registryAdded.length > 0
-			|| !(pureContinuation && capabilityState.pendingTask)
+			|| (routeEveryTurn && !(pureContinuation && capabilityState.pendingTask))
 		);
 		let routingSucceeded = false;
+		if (fastStart && !capabilityState.firstRouteCompleted) {
+			const nextTools = unique([...configuredAlwaysTools, REQUEST_CAPABILITIES_TOOL]);
+			try {
+				pi.setActiveTools(nextTools);
+				capabilityState.managedActiveTools = nextTools;
+				capabilityState.lastAppliedTools = nextTools;
+				capabilityState.firstRouteCompleted = true;
+				routingSucceeded = true;
+			} catch (error) {
+				console.warn("[pi-prompt-diet] Failed to apply fastStart alwaysTools:", error);
+			}
+		}
 		if (shouldRoute) {
 			try {
 				const candidateRoute = await routeCapabilities(
@@ -689,6 +719,19 @@ export default function promptDiet(pi: ExtensionAPI) {
 				}
 			} catch (error) {
 				console.warn("[pi-prompt-diet] Incremental capability routing failed; preserving current capabilities:", error);
+			}
+		}
+
+		if (!capabilityState.firstRouteCompleted && !routingSucceeded && configuredAlwaysTools.length > 0) {
+			const fallbackTools = unique([...configuredAlwaysTools, REQUEST_CAPABILITIES_TOOL]);
+			try {
+				pi.setActiveTools(fallbackTools);
+				capabilityState.managedActiveTools = fallbackTools;
+				capabilityState.lastAppliedTools = fallbackTools;
+				capabilityState.firstRouteCompleted = true;
+				routingSucceeded = true;
+			} catch (error) {
+				console.warn("[pi-prompt-diet] Failed to apply alwaysTools fallback:", error);
 			}
 		}
 

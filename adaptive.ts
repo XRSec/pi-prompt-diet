@@ -16,6 +16,10 @@ export interface AdaptiveConfig {
 	requireExplicitUserIntent?: string[];
 	maxAdditionsPerRequest?: number;
 	maxRequestsPerTurn?: number;
+	/** When false (default), route only on cold start and registry changes; later turns rely on request_capabilities. */
+	routeEveryTurn?: boolean;
+	/** Abort routing/distillation LLM calls after this many ms; fall back to current capabilities. Default 5000. */
+	routingTimeoutMs?: number;
 }
 
 export interface CapabilityTool {
@@ -310,16 +314,32 @@ async function completeJson(
 ): Promise<Record<string, unknown> | undefined> {
 	const model = selectModel(ctx, config.model);
 	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return undefined;
-	const response = await ctx.modelRegistry.complete(
-		model,
-		{
-			systemPrompt,
-			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
-		},
-		{ signal: ctx.signal, maxTokens, cacheRetention: "none" },
-	);
-	if (response.stopReason === "aborted" || response.stopReason === "error") return undefined;
-	return parseJsonObject(responseText(response));
+	const timeoutMs = config.routingTimeoutMs ?? 5000;
+	const parentSignal = ctx.signal;
+	const timeoutController = new AbortController();
+	const onParentAbort = () => timeoutController.abort(parentSignal?.reason);
+	parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+	const timer = setTimeout(() => timeoutController.abort(new Error("routing timeout")), timeoutMs);
+	try {
+		const response = await ctx.modelRegistry.complete(
+			model,
+			{
+				systemPrompt,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+			},
+			{ signal: timeoutController.signal, maxTokens, cacheRetention: "none" },
+		);
+		if (response.stopReason === "aborted" || response.stopReason === "error") return undefined;
+		return parseJsonObject(responseText(response));
+	} catch (error) {
+		if (timeoutController.signal.aborted && !parentSignal?.aborted) {
+			console.warn(`[pi-prompt-diet] Routing LLM call timed out after ${timeoutMs}ms; keeping current capabilities.`);
+		}
+		return undefined;
+	} finally {
+		clearTimeout(timer);
+		parentSignal?.removeEventListener("abort", onParentAbort);
+	}
 }
 
 function strictStringArray(value: unknown): string[] | undefined {

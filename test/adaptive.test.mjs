@@ -177,7 +177,7 @@ test("incremental routing preserves capabilities, then a read creates and reuses
 
 	await harness.emit("session_start", { reason: "new" }, harness.ctx);
 	const warm = await harness.emit("before_agent_start", eventFor(skills), harness.ctx);
-	assert.equal(completions, 3);
+	assert.equal(completions, 2, "subsequent turns skip routing unless routeEveryTurn is enabled");
 	assert.match(warm.systemPrompt, /Verify freshness/);
 	assert.doesNotMatch(warm.systemPrompt, /Long original weather helper description/);
 
@@ -362,6 +362,10 @@ test("router payload deduplicates continuation state", async () => {
 		}
 		return { stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":[]}' }] };
 	});
+	const project = join(testHome, "route-every-turn");
+	mkdirSync(join(project, ".pi"), { recursive: true });
+	writeFileSync(join(project, ".pi", "pi-prompt-diet.json"), JSON.stringify({ adaptive: { routeEveryTurn: true } }));
+	harness.ctx.cwd = project;
 	const event = eventFor([]);
 
 	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
