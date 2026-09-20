@@ -7,15 +7,10 @@ import { dirname, join } from "node:path";
 export interface AdaptiveConfig {
 	enabled?: boolean;
 	model?: string;
-	alwaysTools?: string[];
-	maxTools?: number;
-	maxSkills?: number;
+	preflightModel?: string;
+	softRouting?: boolean;
 	distillSkills?: boolean;
 	distillToolGuidelines?: boolean;
-	neverAutoActivate?: string[];
-	requireExplicitUserIntent?: string[];
-	maxAdditionsPerRequest?: number;
-	maxRequestsPerTurn?: number;
 }
 
 export interface CapabilityTool {
@@ -30,20 +25,6 @@ export interface CapabilitySkill {
 	name: string;
 	description: string;
 	filePath: string;
-}
-
-export interface PromptRoute {
-	tools: string[];
-	skills: string[];
-}
-
-export interface IncrementalRouteContext {
-	activeTools?: string[];
-	activeSkills?: string[];
-	recentUserRequests?: string[];
-	pendingTask?: string;
-	intentSummary?: string;
-	registryAdded?: string[];
 }
 
 export interface SkillCapsule {
@@ -84,10 +65,6 @@ export interface ToolGuidelineCapsuleCache {
 	version: 1;
 	tools: Record<string, ToolGuidelineCapsule>;
 }
-
-const ROUTER_SYSTEM_PROMPT = `You are an incremental capability router for a coding agent. Select only newly required registered tools and skills that are not already active.
-Return JSON only, with exactly this shape: {"tools":["tool-name"],"skills":["skill-name"]}.
-Use the current request together with continuation context and recent requests. A short continuation such as "continue" inherits the pending task. Only return names present in the supplied inactive catalog. Prefer recall when a missing capability would block completion, but do not select unrelated capabilities. Honor explicit prohibitions and hypothetical/planning-only framing: if the user says not to call, use, delegate, execute, or modify, do not activate capabilities for that prohibited action merely because capability names or execution scenarios are mentioned. A skill is guidance, while a tool is executable. If a newly selected skill must be opened, include read when it is inactive and available. Do not answer the user and do not emit prose.`
 
 const DISTILL_SYSTEM_PROMPT = `You distill a reusable routing capsule from one agent Skill file. Return JSON only with exactly this shape: {"trigger":"...","essentialRules":["..."],"readFullWhen":"..."}.
 The trigger must state when the skill applies.
@@ -269,7 +246,7 @@ export function formatSkillCapsule(capsule: SkillCapsule): string {
 	return `${capsule.trigger}${readCondition}${rules ? ` ${rules}` : ""}`.trim();
 }
 
-function compactCatalogDescription(value: string, maxLength: number): string {
+export function compactCatalogDescription(value: string, maxLength: number): string {
 	const clean = value.trim().replace(/\s+/g, " ");
 	if (clean.length <= maxLength) return clean;
 	return `${clean.slice(0, maxLength - 3).trimEnd()}...`;
@@ -298,10 +275,12 @@ function selectModel(ctx: ExtensionContext, configuredModel?: string) {
 	if (!configuredModel) return ctx.model;
 	const separator = configuredModel.indexOf("/");
 	if (separator <= 0 || separator === configuredModel.length - 1) return undefined;
-	return ctx.modelRegistry.find(configuredModel.slice(0, separator), configuredModel.slice(separator + 1));
+	const provider = configuredModel.slice(0, separator);
+	const modelId = configuredModel.slice(separator + 1);
+	return ctx.modelRegistry.find(provider, modelId) || ctx.model;
 }
 
-async function completeJson(
+export async function completeJson(
 	ctx: ExtensionContext,
 	config: AdaptiveConfig,
 	systemPrompt: string,
@@ -310,20 +289,20 @@ async function completeJson(
 ): Promise<Record<string, unknown> | undefined> {
 	const model = selectModel(ctx, config.model);
 	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return undefined;
-	const response = await ctx.modelRegistry.complete(
-		model,
-		{
-			systemPrompt,
-			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
-		},
-		{ signal: ctx.signal, maxTokens, cacheRetention: "none" },
-	);
-	if (response.stopReason === "aborted" || response.stopReason === "error") return undefined;
-	return parseJsonObject(responseText(response));
-}
-
-function strictStringArray(value: unknown): string[] | undefined {
-	return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
+	try {
+		const response = await ctx.modelRegistry.complete(
+			model,
+			{
+				systemPrompt,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+			},
+			{ signal: ctx.signal, maxTokens, cacheRetention: "none" },
+		);
+		if (response.stopReason === "aborted" || response.stopReason === "error") return undefined;
+		return parseJsonObject(responseText(response));
+	} catch (e) {
+		return undefined;
+	}
 }
 
 function conciseText(value: unknown, maxLength: number): value is string {
@@ -349,76 +328,6 @@ function isToolCapsule(value: unknown): value is ToolGuidelineCapsule {
 		&& typeof capsule.fingerprint === "string" && typeof capsule.reason === "string"
 		&& (capsule.mode === "full" || (capsule.mode === "capsule"
 			&& completeRules(capsule.essentialRules, 320) && capsule.essentialRules.length > 0));
-}
-
-export async function routeCapabilities(
-	ctx: ExtensionContext,
-	config: AdaptiveConfig,
-	userPrompt: string,
-	tools: CapabilityTool[],
-	skills: CapabilitySkill[],
-	cache: SkillCapsuleCache,
-	context: IncrementalRouteContext = {},
-): Promise<PromptRoute | undefined> {
-	const activeTools = new Set(context.activeTools ?? []);
-	const activeSkills = new Set(context.activeSkills ?? []);
-	const inactiveTools = tools.filter((tool) => !activeTools.has(tool.name)).map((tool) => ({
-		name: tool.name,
-		description: compactCatalogDescription(tool.description, 220),
-	}));
-	const inactiveSkills = skills.filter((skill) => !activeSkills.has(skill.name)).map((skill) => {
-		const capsule = getValidSkillCapsule(cache, skill);
-		return {
-			name: skill.name,
-			description: capsule
-				? compactCatalogDescription(formatSkillCapsule(capsule), 400)
-				: compactCatalogDescription(skill.description, 500),
-		};
-	});
-	if (inactiveTools.length === 0 && inactiveSkills.length === 0) return { tools: [], skills: [] };
-	const pendingTask = context.pendingTask?.trim() || undefined;
-	const intentSummary = context.intentSummary?.trim() || undefined;
-	const recentUserRequests = [...new Set((context.recentUserRequests ?? []).map((request) => request.trim()).filter(Boolean))]
-		.filter((request) => request !== pendingTask && request !== intentSummary);
-	const result = await completeJson(
-		ctx,
-		config,
-		ROUTER_SYSTEM_PROMPT,
-		JSON.stringify({
-			userRequest: userPrompt,
-			recentUserRequests,
-			pendingTask,
-			intentSummary: intentSummary === pendingTask ? undefined : intentSummary,
-			activeTools: [...activeTools],
-			activeSkills: [...activeSkills],
-			registryAdded: context.registryAdded ?? [],
-			tools: inactiveTools,
-			skills: inactiveSkills,
-		}),
-		1000,
-	);
-	if (!result) return undefined;
-
-	const requestedTools = strictStringArray(result.tools);
-	const requestedSkills = strictStringArray(result.skills);
-	if (!requestedTools || !requestedSkills) return undefined;
-
-	const availableTools = new Set(tools.map((tool) => tool.name));
-	const availableSkills = new Set(skills.map((skill) => skill.name));
-	const selectedSkills = [...new Set(requestedSkills)]
-		.filter((name) => availableSkills.has(name) && !activeSkills.has(name))
-		.slice(0, config.maxSkills ?? 8);
-	const selectedTools = requestedTools.filter((name) => availableTools.has(name) && !activeTools.has(name));
-	if (requestedTools.length + requestedSkills.length > 0 && selectedTools.length + selectedSkills.length === 0) return undefined;
-
-	const requiredTools: string[] = [];
-	if (selectedSkills.length > 0 && availableTools.has("read") && !activeTools.has("read")) requiredTools.push("read");
-	const additions = [...new Set([...requiredTools, ...selectedTools])];
-
-	return {
-		tools: additions.slice(0, config.maxTools ?? 16),
-		skills: [...new Set(selectedSkills)],
-	};
 }
 
 export async function distillToolGuidelines(
@@ -453,7 +362,6 @@ export async function distillToolGuidelines(
 	};
 	if (result.mode === "full") return { ...common, mode: "full" };
 	const essentialRules = result.essentialRules;
-	// Reject an unsafe summary rather than cutting off constraints or dropping rules.
 	if (!completeRules(essentialRules, 320) || essentialRules.length === 0
 		|| essentialRules.join("\n").length >= guidelines.join("\n").length) {
 		return { ...common, mode: "full", reason: "Capsule is invalid, exceeds the rule budget, or is not shorter than the original." };
