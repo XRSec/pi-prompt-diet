@@ -67,16 +67,16 @@ In standard setups, this causes:
 
 ---
 
-### 🏛️ The Collaboration Matrix: Advisor & General
+### 🏛️ Operational Roles & Architecture
 
-In complex engineering tasks, `pi-prompt-diet` works in harmony with `pi-general`:
+In production workflows, `pi-prompt-diet` operates alongside `pi-general`:
 
 | Role | Component | Primary Model | Responsibility |
 | :--- | :--- | :--- | :--- |
-| **Lord (主公)** | **User** | Human | Issues top-level strategic intent and requirements. |
-| **Advisor (军师)** | **`pi-prompt-diet`** | `gemini-3.5-flash-lite` | Context slimming, Prompt Cache protection, and pre-flight `<system_directive>` hints. |
-| **General (将军)** | **`pi-general`** | Local State Machine + `gemini-3.1-pro` | Runtime discipline, read-streak whiplash, verify-after-action guard, and deep deadlock intervention. |
-| **Soldier (小兵)** | **Main Agent** | `gemini-3.8-flash` | High-throughput, precise code modifications and tool execution. |
+| **Commander (User)** | **User** | Human | Top-level strategic intent, requirement specification, and final acceptance. |
+| **Main Agent (Frontline)** | **Main Agent** | `cpa/gemini-3.1-pro` | High-throughput, precise code edits, bash commands, and rapid execution (2-5 actions/turn). |
+| **Supervisor & Discipline** | **`pi-general`** | State Machine + `cpa/gemini-3.8-flash` | Runtime discipline, read-streak backoff, verify-after-action guard, anti-corner-cutting, and deep reflection. |
+| **Preflight Router** | **`pi-prompt-diet`** | `cpa/gemini-3.5-flash-lite` | Context slimming, Prompt Cache protection, and lightweight `<system_directive>` attention routing. |
 
 ---
 
@@ -194,7 +194,7 @@ pi
 * **热重载 (`/reload`)**：在反重力 IDE 中修改了 `index.ts` 或 `discipline.ts` 代码后，**无需退出重启**，直接在对话框输入 `/reload` 即可毫秒级重新加载所有扩展代码与配置！
 * **实时状态查询**：
   * `/pi-prompt-diet`：查看当前已暴露工具、待命目录、胶囊缓存量；
-  * `/general`：查看大将军督战状态、只读探查计数与意图模式（参谋分析 / 临阵作战）；
+  * `/general`：查看运行时纪律状态、只读探查计数与意图模式（Analytical / Execution）；
 * **查看最新事件历史**：
   ```text
   /tree          # 进入分支树，按 Ctrl+X 复制历史消息
@@ -211,7 +211,7 @@ pi
 pi -p --mode json "查看当前时间" | jq .
 ```
 
-通过过滤 `event.type == "tool_result"` 可以查看 `[pi-general 大将军令]` 或 `<system_directive>` 的真实注入结果。
+通过过滤 `event.type == "tool_result"` 可以查看 `[runtime-discipline]` 或 `<system_directive>` 的真实注入结果。
 
 ---
 
@@ -223,7 +223,7 @@ Pi 会将所有会话的底层 JSONL 存储于本地：
 # 查看当前工作区最近一次会话的记录文件
 ls -lt ~/.pi/agent/sessions/--Users-xr-*.jsonl | head -n 5
 
-# 用 python 快速提取某个会话的工具调用轨迹与大将军令
+# 用 python 快速提取某个会话的工具调用轨迹与纪律指令
 python3 -c "
 import json, glob, os
 files = sorted(glob.glob(os.path.expanduser('~/.pi/agent/sessions/*/*.jsonl')), key=os.path.getmtime)
@@ -232,7 +232,7 @@ with open(files[-1]) as f:
         d = json.loads(line)
         if d.get('message', {}).get('role') == 'toolResult':
             for c in d['message'].get('content', []):
-                if '大将军令' in c.get('text', ''):
+                if 'runtime-discipline' in c.get('text', '') or 'safety-policy' in c.get('text', ''):
                     print(c.get('text'))
 "
 ```

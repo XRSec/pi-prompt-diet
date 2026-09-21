@@ -351,16 +351,31 @@ export default function promptDiet(pi: ExtensionAPI) {
 	pi.on("context", async (event, _ctx) => {
 		const sessionName = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
 		const hint = turnRoutingHints.get(sessionName);
-		if (hint) {
-			const lastUser = event.messages.findLast((m: any) => m.role === "user");
-			if (lastUser && Array.isArray(lastUser.content)) {
-				const textBlock = lastUser.content.find((c: any) => c.type === "text");
-				if (textBlock && typeof textBlock.text === "string") {
-					textBlock.text = `<system_directive>${hint}</system_directive>\n\n${textBlock.text}`;
-				}
-			}
+		if (!hint) return { messages: event.messages };
+
+		const lastUserIdx = event.messages.findLastIndex((m: any) => m && m.role === "user");
+		if (lastUserIdx === -1) return { messages: event.messages };
+
+		const lastUser = event.messages[lastUserIdx];
+		if (!Array.isArray(lastUser.content)) return { messages: event.messages };
+
+		const textIdx = lastUser.content.findIndex((c: any) => c && c.type === "text" && typeof c.text === "string");
+		if (textIdx === -1) return { messages: event.messages };
+
+		const textBlock = lastUser.content[textIdx];
+		if (textBlock.text.startsWith("<system_directive>")) {
+			return { messages: event.messages };
 		}
-		return { messages: event.messages };
+
+		const newContent = [...lastUser.content];
+		newContent[textIdx] = {
+			...textBlock,
+			text: `<system_directive>${hint}</system_directive>\n\n${textBlock.text}`,
+		};
+
+		const newMessages = [...event.messages];
+		newMessages[lastUserIdx] = { ...lastUser, content: newContent };
+		return { messages: newMessages };
 	});
 
 	pi.on("tool_result", (event, ctx) => {
@@ -426,7 +441,9 @@ export default function promptDiet(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, _ctx) => {
 		const cwd = _ctx.cwd || process.cwd();
 		const config = loadConfig(cwd);
-		console.error("[Diet] loaded config:", JSON.stringify(config.adaptive));
+		if (process.env.DEBUG) {
+			console.error("[Diet] loaded config:", JSON.stringify(config.adaptive));
+		}
 
 		if (config.enabled === false) return undefined;
 
@@ -467,7 +484,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 		let preflightSucceeded = false;
 
 		// Skip pure continuations heuristically to save preflight costs
-		const isContinuation = /^(continue|go on|继续|继续做|好的|可以|再试一次)$/i.test(event.prompt.trim().replace(/[。.!！]$/, ""));
+		const isContinuation = /^(continue|go on|ok|go|ok go|proceed|yes|y|继续|继续做|继续吧|好的|可以|收到|再试一次)$/i.test(event.prompt.trim().replace(/[。.!！]$/, ""));
 		if (isContinuation) {
 			preflightSucceeded = true;
 			routedTools = typeof (pi as any).getActiveTools === "function"
@@ -499,6 +516,9 @@ Only include names that exist in the catalog. If unsure, prefer a minimal set.
 
 SPECIAL MEMORY RULE:
 If the user's request explicitly or implicitly references past work, historical configurations, prior discussions, or unresolved context (e.g., words like '之前', '上次', '记得', '以前', '曾经', 'earlier', 'we configured', 'last time'), you MUST include 'search-memory' in focus_skills and/or 'memory_recall' in focus_tools if present in the catalog.
+
+SPECIAL BROWSER & AUTOMATION RULE:
+If the user's task mentions browser operations, web pages, browser profiles, or UI interaction (e.g., '浏览器', '网页', 'profile', 'profiles', 'browser', 'GUI', 'desktop'), include relevant browser/automation skills (e.g., 'ego-browser', 'cua-driver') if present in the catalog.
 
 SPECIAL DOCS RULE:
 If the user's task asks about or involves the Pi coding agent framework itself (e.g. its SDK, extensions, themes, skills, CLI flags, internal APIs, or subprocess testing), set need_docs to true. Otherwise set need_docs to false.`;
@@ -546,7 +566,9 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 						userAnalysisPrompt,
 						250
 					);
-					console.error("[Preflight] Response:", response);
+					if (process.env.DEBUG) {
+						console.error("[Preflight] Response:", response);
+					}
 					
 					if (response && (Array.isArray(response.focus_tools) || Array.isArray(response.focus_skills))) {
 						preflightSucceeded = true;
@@ -570,7 +592,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 						if (hintParts.length > 0) {
 							turnRoutingHints.set(
 								sessionName,
-								`Pre-flight suggestion: focus on ${hintParts.join(" and ")}. (If past context is needed or details are missing, feel free to use memory tools/skills. Always match user's language and requirements for output.)`
+								`Preflight route: focus on ${hintParts.join(" and ")}. (If historical context is needed, feel free to use memory tools/skills. Always match user's language and requirements for output.)`
 							);
 						}
 					}

@@ -364,4 +364,44 @@ test("preflight complete exception triggers fail-open preserving all tools and s
 	assert.doesNotMatch(result.systemPrompt, /Inactive skills/);
 });
 
+test("context event injects preflight hints into last user message safely and idempotently", async () => {
+	const { skills } = createSkills("context-injection");
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: '{"focus_tools":["read"],"focus_skills":["weather-helper"],"need_docs":false}' }],
+	}), [], { adaptive: { softRouting: true } });
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	await harness.emit("before_agent_start", eventFor(skills), harness.ctx);
+
+	const originalMessages = [
+		{ role: "user", content: [{ type: "text", text: "Check today weather" }] }
+	];
+	const contextRes1 = await harness.emit("context", { messages: originalMessages }, harness.ctx);
+	assert.ok(contextRes1.messages[0].content[0].text.includes("<system_directive>Preflight route: focus on skills: [weather-helper] and tools: [read]."));
+	assert.ok(contextRes1.messages[0].content[0].text.includes("Check today weather"));
+	// Original message remains untouched
+	assert.equal(originalMessages[0].content[0].text, "Check today weather");
+
+	// Second call with the transformed messages must be idempotent
+	const contextRes2 = await harness.emit("context", { messages: contextRes1.messages }, harness.ctx);
+	const directiveCount = (contextRes2.messages[0].content[0].text.match(/<system_directive>/g) || []).length;
+	assert.equal(directiveCount, 1);
+});
+
+test("pure affirmative continuations bypass preflight model call", async () => {
+	const { skills } = createSkills("continuations");
+	let modelCalled = false;
+	const harness = createHarness(async () => {
+		modelCalled = true;
+		return { stopReason: "stop", content: [{ type: "text", text: "{}" }] };
+	}, [], { adaptive: { softRouting: true } });
+
+	for (const phrase of ["ok go", "go", "ok", "proceed", "继续吧", "收到", "yes"]) {
+		modelCalled = false;
+		const event = { ...eventFor(skills), prompt: phrase };
+		await harness.emit("before_agent_start", event, harness.ctx);
+		assert.equal(modelCalled, false, `Expected '${phrase}' to bypass preflight`);
+	}
+});
+
 test.after(() => rmSync(testHome, { recursive: true, force: true }));
