@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import {
 	completeJson,
 	compactCatalogDescription,
+	truncateHeadTail,
 	distillSkill,
 	distillToolGuidelines,
 	formatSkillCapsule,
@@ -257,57 +258,59 @@ export default function promptDiet(pi: ExtensionAPI) {
 	const pendingDistillation = new Set<string>();
 	const pendingToolDistillation = new Set<string>();
 
-	pi.registerTool({
-		name: REQUEST_CAPABILITIES_TOOL,
-		label: "Request Capabilities",
-		description: "Dynamically activate an inactive tool or skill when required. Supplies full usage documentation immediately upon activation.",
-		promptSnippet: "Activate additional registered tools or skills on demand",
-		parameters: {
-			type: "object",
-			properties: {
-				tools: { type: "array", items: { type: "string" }, description: "Tool names to activate" },
-				skills: { type: "array", items: { type: "string" }, description: "Skill names to activate" },
-				reason: { type: "string", description: "Why these capabilities are required" },
+	if (typeof (pi as any).registerTool === "function") {
+		(pi as any).registerTool({
+			name: REQUEST_CAPABILITIES_TOOL,
+			label: "Request Capabilities",
+			description: "Dynamically activate an inactive tool or skill when required. Supplies full usage documentation immediately upon activation.",
+			promptSnippet: "Activate additional registered tools or skills on demand",
+			parameters: {
+				type: "object",
+				properties: {
+					tools: { type: "array", items: { type: "string" }, description: "Tool names to activate" },
+					skills: { type: "array", items: { type: "string" }, description: "Skill names to activate" },
+					reason: { type: "string", description: "Why these capabilities are required" },
+				},
+				required: ["reason"],
+				additionalProperties: false,
+			} as any,
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+				const allTools = pi.getAllTools();
+				const current = pi.getActiveTools();
+				const requestedTools = unique((params.tools ?? []) as string[]);
+				const requestedSkills = unique((params.skills ?? []) as string[]);
+
+				const addedTools = requestedTools.filter((t) => allTools.some((at) => at.name === t) && !current.includes(t));
+				if (addedTools.length > 0) {
+					pi.setActiveTools(unique([...current, ...addedTools, REQUEST_CAPABILITIES_TOOL]));
+				}
+
+				const toolDocs = allTools
+					.filter((t) => addedTools.includes(t.name))
+					.map((t) => `### Tool: ${t.name}\n${t.description}`);
+
+				const skillDocs = [...knownSkills.values()]
+					.filter((s) => requestedSkills.includes(s.name))
+					.map((s) => `### Skill: ${s.name}\nPath: ${s.filePath}\nDescription: ${s.description}`);
+
+				const responseBlocks: string[] = [];
+				if (toolDocs.length > 0) {
+					responseBlocks.push(`Activated Tools with full instructions:\n${toolDocs.join("\n\n")}`);
+				}
+				if (skillDocs.length > 0) {
+					responseBlocks.push(`Activated Skills with instructions:\n${skillDocs.join("\n\n")}`);
+				}
+				if (responseBlocks.length === 0) {
+					responseBlocks.push("No new tools or skills needed activation (already active or not found).");
+				}
+
+				return {
+					content: [{ type: "text", text: responseBlocks.join("\n\n") }],
+					details: { addedTools, addedSkills: requestedSkills },
+				};
 			},
-			required: ["reason"],
-			additionalProperties: false,
-		} as any,
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const allTools = pi.getAllTools();
-			const current = pi.getActiveTools();
-			const requestedTools = unique((params.tools ?? []) as string[]);
-			const requestedSkills = unique((params.skills ?? []) as string[]);
-
-			const addedTools = requestedTools.filter((t) => allTools.some((at) => at.name === t) && !current.includes(t));
-			if (addedTools.length > 0) {
-				pi.setActiveTools(unique([...current, ...addedTools, REQUEST_CAPABILITIES_TOOL]));
-			}
-
-			const toolDocs = allTools
-				.filter((t) => addedTools.includes(t.name))
-				.map((t) => `### Tool: ${t.name}\n${t.description}`);
-
-			const skillDocs = [...knownSkills.values()]
-				.filter((s) => requestedSkills.includes(s.name))
-				.map((s) => `### Skill: ${s.name}\nPath: ${s.filePath}\nDescription: ${s.description}`);
-
-			const responseBlocks: string[] = [];
-			if (toolDocs.length > 0) {
-				responseBlocks.push(`Activated Tools with full instructions:\n${toolDocs.join("\n\n")}`);
-			}
-			if (skillDocs.length > 0) {
-				responseBlocks.push(`Activated Skills with instructions:\n${skillDocs.join("\n\n")}`);
-			}
-			if (responseBlocks.length === 0) {
-				responseBlocks.push("No new tools or skills needed activation (already active or not found).");
-			}
-
-			return {
-				content: [{ type: "text", text: responseBlocks.join("\n\n") }],
-				details: { addedTools, addedSkills: requestedSkills },
-			};
-		},
-	});
+		});
+	}
 
 	if (typeof (pi as any).registerCommand === "function") {
 		(pi as any).registerCommand("pi-prompt-diet", {
@@ -450,22 +453,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 			}
 		}
 
-		// ── 1. Guidelines 处理（未激活的工具绝不配留准则，默认仅保留精简核心） ─────────
-		const guidelinesStart = prompt.indexOf("Guidelines:\n");
-		if (guidelinesStart !== -1) {
-			// 寻找下一个合法的结构化区块边界（以 XML 标签 < 或 Markdown 标题 # 或文档块开头）
-			const rest = prompt.slice(guidelinesStart + "Guidelines:\n".length);
-			const boundaryMatch = rest.match(/\n\n(?=[<#]|Pi documentation\b)/);
-			const nextSectionStart = boundaryMatch && boundaryMatch.index !== undefined
-				? guidelinesStart + "Guidelines:\n".length + boundaryMatch.index
-				: prompt.length;
-
-			const core = selectedCoreGuidelines(config.guidelines?.customCore);
-			const slimText = `Guidelines:\n${core.join("\n")}`;
-			prompt = prompt.slice(0, guidelinesStart) + slimText + prompt.slice(nextSectionStart);
-		}
-
-		// ── 2. 检查并提取系统文档资源（以通用 XML/标题正则匹配，严禁硬编码语言词汇） ──────
+		// ── 1. 检查并提取系统文档资源（以通用 XML/标题正则匹配，严禁硬编码语言词汇） ──────
 		const docsMatch = prompt.match(/(?:<docs>[\s\S]*?<\/docs>|Pi documentation[\s\S]*?(?=\n\n[<#]|$))/);
 		const rawDocsBlock = docsMatch ? docsMatch[0] : "";
 
@@ -476,10 +464,18 @@ export default function promptDiet(pi: ExtensionAPI) {
 		let routedTools: string[] = [];
 		let routedSkills: string[] = [];
 		let needDocs = false;
+		let preflightSucceeded = false;
 
 		// Skip pure continuations heuristically to save preflight costs
 		const isContinuation = /^(continue|go on|继续|继续做|好的|可以|再试一次)$/i.test(event.prompt.trim().replace(/[。.!！]$/, ""));
-		if (config.adaptive?.softRouting !== false && event.prompt.trim() !== "" && !isContinuation) {
+		if (isContinuation) {
+			preflightSucceeded = true;
+			routedTools = typeof (pi as any).getActiveTools === "function"
+				? (pi as any).getActiveTools().filter((t: string) => t !== REQUEST_CAPABILITIES_TOOL)
+				: allTools.map((t) => t.name);
+			routedSkills = rawSkills.map((s) => s.name);
+			needDocs = true;
+		} else if (config.adaptive?.softRouting !== false && event.prompt.trim() !== "") {
 			try {
 				const preflightModelStr = config.adaptive?.preflightModel || "cpa/gemini-3.5-flash-lite";
 				let preflightModel = _ctx.model;
@@ -530,16 +526,18 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 						if (recent.length > 0) {
 							recentHistory = `\n\n【RECENT CONVERSATION HISTORY】:\n` + recent.map((m: any) => {
 								let text = m.content?.find((c: any) => c.type === "text")?.text || "(No text)";
-								text = text.trim();
-								const maxLength = m.role === "user" ? 400 : 600;
-								return `${m.role.toUpperCase()}: ${text.slice(0, maxLength)}${text.length > maxLength ? "..." : ""}`;
+								const maxLength = m.role === "user" ? 800 : 800;
+								// 头部意图 + 尾部最新报错/补充 截取策略
+								const truncated = truncateHeadTail(text, maxLength, 0.45);
+								return `${m.role.toUpperCase()}: ${truncated}`;
 							}).join("\n\n");
 						}
 					} catch (e) {
 						// ignore history extraction errors
 					}
 
-					const userAnalysisPrompt = `CATALOG:\n${JSON.stringify(catalog, null, 2)}${memoryContext}${recentHistory}\n\n【USER LATEST REQUEST】:\n${event.prompt}`;
+					const promptForAnalysis = truncateHeadTail(event.prompt, 3500, 0.4);
+					const userAnalysisPrompt = `CATALOG:\n${JSON.stringify(catalog, null, 2)}${memoryContext}${recentHistory}\n\n【USER LATEST REQUEST】:\n${promptForAnalysis}`;
 					
 					const response = await completeJson(
 						_ctx,
@@ -550,7 +548,8 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 					);
 					console.error("[Preflight] Response:", response);
 					
-					if (response) {
+					if (response && (Array.isArray(response.focus_tools) || Array.isArray(response.focus_skills))) {
+						preflightSucceeded = true;
 						if (Array.isArray(response.focus_tools)) {
 							routedTools = (response.focus_tools as string[]).filter((t) => allTools.some((at) => at.name === t));
 						}
@@ -578,8 +577,15 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 				}
 			} catch (e) {
 				console.error("[Preflight] Error:", e);
-				// Ignore preflight failures to avoid breaking the main loop
 			}
+		}
+
+		// Fail-Open 容灾回退：预检不可用、抛错或返回空时，全量保留所有能力，保障任务不中断
+		if (!preflightSucceeded) {
+			console.warn("[pi-prompt-diet] Preflight soft routing bypassed or failed, falling back to fail-open (all capabilities preserved).");
+			routedTools = allTools.map((t) => t.name);
+			routedSkills = rawSkills.map((s) => s.name);
+			needDocs = true;
 		}
 
 		// ── 4. 物理裁剪底层活跃工具（Required Tools + 语境路由工具） ─────────
@@ -598,8 +604,49 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 			console.warn("[pi-prompt-diet] Failed to set active tools:", error);
 		}
 
-		// ── 5. 重写 System Prompt 中的工具段落、文档段落与技能段落 ──────────────────
-		prompt = rewriteAvailableTools(prompt, new Set(activeToolNames), allTools);
+		// ── 5. 重写 System Prompt 中的工具段落、Guidelines 段落、文档段落与技能段落 ────
+		const activeToolsSet = new Set(activeToolNames);
+		prompt = rewriteAvailableTools(prompt, activeToolsSet, allTools);
+
+		// Guidelines 处理：保留核心准则 + 属于活跃工具集的第三方工具准则（或其蒸馏胶囊）
+		const guidelinesStart = prompt.indexOf("Guidelines:\n");
+		if (guidelinesStart !== -1) {
+			const rest = prompt.slice(guidelinesStart + "Guidelines:\n".length);
+			const boundaryMatch = rest.match(/\n\n(?=[<#]|Pi documentation\b|Inactive skills\b)/);
+			const nextSectionStart = boundaryMatch && boundaryMatch.index !== undefined
+				? guidelinesStart + "Guidelines:\n".length + boundaryMatch.index
+				: prompt.length;
+
+			const core = selectedCoreGuidelines(config.guidelines?.customCore);
+			const preservedGuidelines = new Set<string>();
+
+			for (const tool of allTools) {
+				if (!activeToolsSet.has(tool.name)) continue;
+				const source = tool.sourceInfo?.source;
+				if (!source || source === "builtin" || source === "sdk") continue;
+
+				const toolSource = typeof source === "string" ? normalizeName(source) : "";
+				const toolName = normalizeName(tool.name);
+				const pkgCfg = (toolSource ? overrides.get(toolSource) : undefined) || overrides.get(toolName);
+				const explicitMode = typeof pkgCfg?.guidelines === "object" ? pkgCfg.guidelines.mode : pkgCfg?.guidelines;
+				if (explicitMode === "full") {
+					for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
+					continue;
+				}
+				if (explicitMode === "slim" || explicitMode === "strip") continue;
+
+				const capsule = getValidToolGuidelineCapsule(toolGuidelineCache, tool as CapabilityTool);
+				if (!capsule || capsule.mode === "full") {
+					for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
+				} else {
+					for (const guideline of formatToolGuidelineCapsule(capsule)) preservedGuidelines.add(guideline);
+				}
+			}
+
+			const allGuidelines = [...core, ...[...preservedGuidelines].map((g) => `- ${g}`)];
+			const slimText = `Guidelines:\n${allGuidelines.join("\n")}`;
+			prompt = prompt.slice(0, guidelinesStart) + slimText + prompt.slice(nextSectionStart);
+		}
 
 		// 文档按需提供：如果未命中 Docs 需求且用户未显式提及框架，将文档段落移出 Prompt
 		const explicitDocsMentioned = /\b(pi|pi-coding-agent|extension|extensions|sdk|skill|skills|theme|themes|tui)\b/i.test(event.prompt);
@@ -607,16 +654,20 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 			prompt = prompt.replace(rawDocsBlock, "");
 		}
 
-		// Skill 只有在用户明确提及或语境命中时才注入，未命中的彻底移除
+		// Skill 只有在用户明确提及或语境命中时才注入完整/胶囊内容，未命中的列出名字供按需激活
 		const skillsStart = prompt.indexOf("<available_skills>");
 		const skillsEnd = prompt.indexOf("</available_skills>");
 		if (skillsStart !== -1 && skillsEnd !== -1) {
 			const promptSkills = event.systemPromptOptions?.skills || [];
 			const activeSkillBlocks: string[] = [];
+			const inactiveSkillNames: string[] = [];
 
 			for (const s of promptSkills) {
 				if (s.disableModelInvocation) continue;
-				if (!neededSkills.has(s.name)) continue; // 未命中的 Skill 彻底不陪跑！
+				if (!neededSkills.has(s.name)) {
+					inactiveSkillNames.push(s.name);
+					continue; // 未命中的 Skill 详细内容不陪跑
+				}
 
 				let desc = (s.description || "").trim();
 				const capabilitySkill = knownSkills.get(resolve(s.filePath));
@@ -633,9 +684,14 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 				activeSkillBlocks.push(`  <skill>\n    <name>${s.name}</name>\n    <description>${desc}</description>\n    <location>${s.filePath}</location>\n  </skill>`);
 			}
 
-			const slimSkillsSection = activeSkillBlocks.length > 0
-				? `<available_skills>\n${activeSkillBlocks.join("\n")}\n</available_skills>`
-				: "";
+			let slimSkillsSection = "";
+			if (activeSkillBlocks.length > 0) {
+				slimSkillsSection = `<available_skills>\n${activeSkillBlocks.join("\n")}\n</available_skills>`;
+			}
+			if (inactiveSkillNames.length > 0) {
+				const inactiveNotice = `Inactive skills (names only; call ${REQUEST_CAPABILITIES_TOOL} with skill name to activate):\n${inactiveSkillNames.join(", ")}`;
+				slimSkillsSection = slimSkillsSection ? `${slimSkillsSection}\n\n${inactiveNotice}` : inactiveNotice;
+			}
 
 			prompt = prompt.slice(0, skillsStart) + slimSkillsSection + prompt.slice(skillsEnd + "</available_skills>".length);
 		}

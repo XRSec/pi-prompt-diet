@@ -9,6 +9,7 @@ process.env.HOME = testHome;
 
 const { default: promptDiet } = await import("../index.ts");
 const {
+	compactCatalogDescription,
 	distillSkill,
 	distillToolGuidelines,
 	fingerprintSkill,
@@ -20,6 +21,7 @@ const {
 	saveSkillCapsule,
 	saveSkillCapsuleCache,
 	saveToolGuidelineCapsule,
+	truncateHeadTail,
 } = await import("../adaptive.ts");
 
 const tools = [
@@ -42,10 +44,24 @@ Guidelines:
 placeholder
 </available_skills>`;
 
-function createHarness(complete, extraTools = []) {
+function createHarness(complete, extraTools = [], configOverride = {}) {
+	const harnessDir = mkdtempSync(join(testHome, "harness-"));
+	mkdirSync(join(harnessDir, ".pi"), { recursive: true });
+	writeFileSync(join(harnessDir, ".pi", "pi-prompt-diet.json"), JSON.stringify({
+		adaptive: {
+			softRouting: false,
+			distillSkills: true,
+			distillToolGuidelines: true,
+			...configOverride.adaptive,
+		},
+		...configOverride,
+	}));
+
 	const handlers = new Map();
 	const registeredTools = [...tools, ...extraTools];
+	let activeTools = registeredTools.map((t) => t.name);
 	const commandDefinitions = new Map();
+	const registeredToolDefs = new Map();
 	const pi = {
 		on(name, handler) {
 			const list = handlers.get(name) ?? [];
@@ -55,12 +71,18 @@ function createHarness(complete, extraTools = []) {
 		registerCommand(name, definition) {
 			commandDefinitions.set(name, definition);
 		},
+		registerTool(definition) {
+			registeredToolDefs.set(definition.name, definition);
+		},
 		getAllTools: () => registeredTools,
-		getActiveTools: () => registeredTools.map((t) => t.name),
+		getActiveTools: () => activeTools,
+		setActiveTools(names) {
+			activeTools = names;
+		},
 	};
 	promptDiet(pi);
 	const ctx = {
-		cwd: process.cwd(),
+		cwd: harnessDir,
 		hasUI: false,
 		signal: undefined,
 		model: { provider: "test", id: "distiller" },
@@ -301,6 +323,45 @@ test("before_agent_start processes guidelines and skills without routing", async
 	assert.match(result.systemPrompt, /<name>other<\/name>/);
 	assert.doesNotMatch(result.systemPrompt, /Use read for files/);
 	assert.doesNotMatch(result.systemPrompt, /Use edit precisely/);
+});
+
+test("truncateHeadTail preserves both head intent and tail error context", () => {
+	const text = "HEADER: Task initialization and background information.\n" +
+		"MIDDLE: " + "step repeating details. ".repeat(40) + "\n" +
+		"TAIL: Critical error trace and latest user supplement.";
+	const truncated = truncateHeadTail(text, 120, 0.45);
+	assert.ok(truncated.includes("HEADER: Task initialization"));
+	assert.ok(truncated.includes("... [truncated] ..."));
+	assert.ok(truncated.includes("Critical error trace"));
+	assert.ok(truncated.length <= 130);
+});
+
+test("preflight routing failure falls back to fail-open and unrouted skills appear as inactive notice", async () => {
+	const { skills } = createSkills("soft-routing-skills");
+	// 模拟预检成功，仅路由出 weather-helper，other 成为 inactive skill
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: '{"focus_tools":["read"],"focus_skills":["weather-helper"],"need_docs":false}' }],
+	}), [], { adaptive: { softRouting: true } });
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	const routed = await harness.emit("before_agent_start", eventFor(skills), harness.ctx);
+	assert.match(routed.systemPrompt, /<name>weather-helper<\/name>/);
+	assert.doesNotMatch(routed.systemPrompt, /<name>other<\/name>/);
+	assert.match(routed.systemPrompt, /Inactive skills \(names only; call request_capabilities with skill name to activate\):\s*other/);
+});
+
+test("preflight complete exception triggers fail-open preserving all tools and skills", async () => {
+	const { skills } = createSkills("fail-open");
+	const harness = createHarness(async () => {
+		throw new Error("Network timeout to preflight model");
+	}, [], { adaptive: { softRouting: true } });
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	const result = await harness.emit("before_agent_start", eventFor(skills), harness.ctx);
+	// Fail-open: all tools and skills remain active
+	assert.ok(result.systemPrompt);
+	assert.match(result.systemPrompt, /<name>weather-helper<\/name>/);
+	assert.match(result.systemPrompt, /<name>other<\/name>/);
+	assert.doesNotMatch(result.systemPrompt, /Inactive skills/);
 });
 
 test.after(() => rmSync(testHome, { recursive: true, force: true }));

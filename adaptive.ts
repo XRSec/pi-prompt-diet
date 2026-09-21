@@ -252,6 +252,18 @@ export function compactCatalogDescription(value: string, maxLength: number): str
 	return `${clean.slice(0, maxLength - 3).trimEnd()}...`;
 }
 
+export function truncateHeadTail(text: string, maxLength: number, headRatio = 0.5): string {
+	const clean = text.trim();
+	if (clean.length <= maxLength) return clean;
+	const marker = "\n... [truncated] ...\n";
+	const available = maxLength - marker.length;
+	if (available <= 20) return clean.slice(0, maxLength);
+
+	const headLen = Math.floor(available * headRatio);
+	const tailLen = available - headLen;
+	return `${clean.slice(0, headLen).trimEnd()}${marker}${clean.slice(-tailLen).trimStart()}`;
+}
+
 function responseText(response: { content: Array<{ type: string; text?: string }> }): string {
 	return response.content
 		.filter((item): item is { type: "text"; text: string } => item.type === "text" && typeof item.text === "string")
