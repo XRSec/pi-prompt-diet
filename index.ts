@@ -196,20 +196,30 @@ function mergeConfig(base: PromptDietConfig, next: PromptDietConfig): PromptDiet
 
 function loadConfig(cwd: string): PromptDietConfig {
 	const userConfigDir = join(homedir(), ".pi", "agent");
+	const userSettingsPath = join(userConfigDir, "settings.json");
 	const primaryUserConfigPath = join(userConfigDir, "pi-prompt-diet.json");
 	const legacyUserConfigPath = join(userConfigDir, "prompt-diet.json");
+
+	const projectSettingsPath = join(cwd, ".pi", "settings.json");
 	const projectConfigPath = join(cwd, ".pi", "pi-prompt-diet.json");
 	const legacyProjectConfigPath = join(cwd, ".pi", "prompt-diet.json");
 
-	if (!existsSync(primaryUserConfigPath) && !existsSync(legacyUserConfigPath)) {
+	let config: PromptDietConfig = structuredClone(DEFAULT_CONFIG);
+
+	// 1. Read global settings.json
+	if (existsSync(userSettingsPath)) {
 		try {
-			mkdirSync(userConfigDir, { recursive: true });
-			writeConfigFile(primaryUserConfigPath, DEFAULT_CONFIG);
+			const parsed = JSON.parse(readFileSync(userSettingsPath, "utf8"));
+			if (parsed && typeof parsed === "object") {
+				const dietBlock = parsed.promptDiet || parsed["pi-prompt-diet"];
+				if (dietBlock && typeof dietBlock === "object") {
+					config = mergeConfig(config, dietBlock);
+				}
+			}
 		} catch {}
 	}
 
-	let config: PromptDietConfig = structuredClone(DEFAULT_CONFIG);
-
+	// 2. Fallback to legacy standalone global files if present
 	for (const p of [legacyUserConfigPath, primaryUserConfigPath]) {
 		if (existsSync(p)) {
 			try {
@@ -218,6 +228,20 @@ function loadConfig(cwd: string): PromptDietConfig {
 		}
 	}
 
+	// 3. Project settings.json override (only if existing, never auto-created)
+	if (existsSync(projectSettingsPath)) {
+		try {
+			const parsed = JSON.parse(readFileSync(projectSettingsPath, "utf8"));
+			if (parsed && typeof parsed === "object") {
+				const dietBlock = parsed.promptDiet || parsed["pi-prompt-diet"];
+				if (dietBlock && typeof dietBlock === "object") {
+					config = mergeConfig(config, dietBlock);
+				}
+			}
+		} catch {}
+	}
+
+	// 4. Fallback to legacy standalone project files if present
 	for (const p of [legacyProjectConfigPath, projectConfigPath]) {
 		if (existsSync(p)) {
 			try {
@@ -225,6 +249,7 @@ function loadConfig(cwd: string): PromptDietConfig {
 			} catch {}
 		}
 	}
+
 	return config;
 }
 

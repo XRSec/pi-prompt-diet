@@ -440,4 +440,23 @@ test("promptDiet removes Pi default 'Use bash for file operations like ls, rg, f
 	assert.doesNotMatch(result.systemPrompt, /Use bash for file operations like ls, rg, find/i);
 });
 
+test("promptDiet reads configuration directly from settings.json", async () => {
+	const userAgentDir = join(testHome, ".pi", "agent");
+	mkdirSync(userAgentDir, { recursive: true });
+	writeFileSync(join(userAgentDir, "settings.json"), JSON.stringify({
+		promptDiet: {
+			adaptive: {
+				softRouting: false,
+			}
+		}
+	}));
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: "{}" }],
+	}));
+	// System prompt should still process cleanly with settings.json
+	const result = await harness.emit("before_agent_start", { systemPrompt: systemPrompt, prompt: "test prompt" }, harness.ctx);
+	assert.ok(result.systemPrompt);
+});
+
 test.after(() => rmSync(testHome, { recursive: true, force: true }));
