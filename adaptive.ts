@@ -286,10 +286,24 @@ function parseJsonObject(text: string): Record<string, unknown> | undefined {
 function selectModel(ctx: ExtensionContext, configuredModel?: string) {
 	if (!configuredModel) return ctx.model;
 	const separator = configuredModel.indexOf("/");
-	if (separator <= 0 || separator === configuredModel.length - 1) return undefined;
+	if (separator <= 0 || separator === configuredModel.length - 1) return ctx.model;
 	const provider = configuredModel.slice(0, separator);
 	const modelId = configuredModel.slice(separator + 1);
-	return ctx.modelRegistry.find(provider, modelId) || ctx.model;
+
+	// 1. Exact match
+	const exact = ctx.modelRegistry.find(provider, modelId);
+	if (exact) return exact;
+
+	// 2. Case-insensitive provider match
+	try {
+		const all = ctx.modelRegistry.getAll?.() ?? [];
+		const matched = all.find(
+			(m: any) => m && m.provider && m.provider.toLowerCase() === provider.toLowerCase() && m.id === modelId
+		);
+		if (matched) return matched;
+	} catch {}
+
+	return ctx.model;
 }
 
 export async function completeJson(
@@ -300,7 +314,12 @@ export async function completeJson(
 	maxTokens: number,
 ): Promise<Record<string, unknown> | undefined> {
 	const model = selectModel(ctx, config.model);
-	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return undefined;
+	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+		if (process.env.DEBUG) {
+			console.error(`[pi-prompt-diet] Model not available or not authenticated: ${config.model}`);
+		}
+		return undefined;
+	}
 	try {
 		const response = await ctx.modelRegistry.complete(
 			model,
@@ -310,9 +329,21 @@ export async function completeJson(
 			},
 			{ signal: ctx.signal, maxTokens, cacheRetention: "none" },
 		);
-		if (response.stopReason === "aborted" || response.stopReason === "error") return undefined;
-		return parseJsonObject(responseText(response));
+		if (response.stopReason === "aborted" || response.stopReason === "error") {
+			if (process.env.DEBUG) {
+				console.error(`[pi-prompt-diet] preflight complete ended with stopReason: ${response.stopReason}, error: ${(response as any).errorMessage}`);
+			}
+			return undefined;
+		}
+		const parsed = parseJsonObject(responseText(response));
+		if (!parsed && process.env.DEBUG) {
+			console.error(`[pi-prompt-diet] Failed to parse JSON from preflight response: ${responseText(response)}`);
+		}
+		return parsed;
 	} catch (e) {
+		if (process.env.DEBUG) {
+			console.error("[pi-prompt-diet] completeJson error:", e);
+		}
 		return undefined;
 	}
 }

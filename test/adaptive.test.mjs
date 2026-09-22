@@ -459,4 +459,24 @@ test("promptDiet reads configuration directly from settings.json", async () => {
 	assert.ok(result.systemPrompt);
 });
 
+test("preflight routing matches provider case-insensitively", async () => {
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: '{"focus_tools":["read"],"focus_skills":[],"need_docs":false}' }],
+	}), [], { adaptive: { softRouting: true, preflightModel: "cpa/gemini-3.5-flash-lite" } });
+	// Custom modelRegistry where find("cpa", ...) is undefined, but getAll has { provider: "CPA", id: "gemini-3.5-flash-lite" }
+	harness.ctx.modelRegistry = {
+		hasConfiguredAuth: (providerOrModel) => true,
+		find: (p, m) => p === "CPA" && m === "gemini-3.5-flash-lite" ? { provider: "CPA", id: m } : undefined,
+		getAll: () => [{ provider: "CPA", id: "gemini-3.5-flash-lite" }],
+		complete: async () => ({
+			stopReason: "stop",
+			content: [{ type: "text", text: '{"focus_tools":["read"],"focus_skills":[],"need_docs":false}' }],
+		}),
+	};
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	const res = await harness.emit("before_agent_start", { systemPrompt, prompt: "test intent" }, harness.ctx);
+	assert.ok(res.systemPrompt);
+});
+
 test.after(() => rmSync(testHome, { recursive: true, force: true }));

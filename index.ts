@@ -59,7 +59,8 @@ const turnRoutingHints = new Map<string, string>();
 const CALL_TOOL = "call_tool";
 const REQUEST_CAPABILITIES_TOOL = "request_capabilities";
 
-// Expanded core baseline: essential operations, surgical edit, FFF search, async tasks, subagents, and user dialog
+// Expanded core baseline: essential operations, surgical edit, FFF search, async tasks, and user dialog.
+// Multi-agent orchestration ('subagent') is dynamically activated via soft routing when needed.
 const DEFAULT_REQUIRED_TOOLS = [
 	"read",
 	"write",
@@ -75,8 +76,6 @@ const DEFAULT_REQUIRED_TOOLS = [
 	// Background task management
 	"bg_run",
 	"bg_status",
-	// Multi-agent orchestration
-	"subagent",
 	// Structured questioning
 	"ask_user_question",
 ];
@@ -590,12 +589,23 @@ export default function promptDiet(pi: ExtensionAPI) {
 			needDocs = true;
 		} else if (config.adaptive?.softRouting !== false && event.prompt.trim() !== "") {
 			try {
-				const preflightModelStr = config.adaptive?.preflightModel || "cpa/gemini-3.5-flash-lite";
+				const preflightModelStr = config.adaptive?.preflightModel || "CPA/gemini-3.5-flash-lite";
 				let preflightModel = _ctx.model;
 				if (preflightModelStr) {
 					const separator = preflightModelStr.indexOf("/");
 					if (separator > 0) {
-						preflightModel = _ctx.modelRegistry.find(preflightModelStr.slice(0, separator), preflightModelStr.slice(separator + 1)) || _ctx.model;
+						const prov = preflightModelStr.slice(0, separator);
+						const mId = preflightModelStr.slice(separator + 1);
+						preflightModel = _ctx.modelRegistry.find(prov, mId);
+						if (!preflightModel) {
+							try {
+								const all = _ctx.modelRegistry.getAll?.() ?? [];
+								preflightModel = all.find(
+									(m: any) => m && m.provider && m.provider.toLowerCase() === prov.toLowerCase() && m.id === mId
+								);
+							} catch {}
+						}
+						preflightModel = preflightModel || _ctx.model;
 					}
 				}
 				
@@ -669,7 +679,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 						{ ...(config.adaptive ?? {}), model: preflightModelStr ?? config.adaptive?.model },
 						systemAnalysisPrompt,
 						userAnalysisPrompt,
-						250
+						800
 					);
 					if (process.env.DEBUG) {
 						console.error("[Preflight] Response:", response);
