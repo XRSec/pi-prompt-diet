@@ -102,6 +102,7 @@ function createHarness(complete, extraTools = [], configOverride = {}) {
 		async executeCommand(name, args = "") {
 			return commandDefinitions.get(name).handler(args, ctx);
 		},
+		registeredToolDefs,
 		ctx,
 	};
 }
@@ -402,6 +403,41 @@ test("pure affirmative continuations bypass preflight model call", async () => {
 		await harness.emit("before_agent_start", event, harness.ctx);
 		assert.equal(modelCalled, false, `Expected '${phrase}' to bypass preflight`);
 	}
+});
+
+test("call_tool meta-tool executes inactive tools directly in a single turn", async () => {
+	let executedWith = null;
+	const customTool = {
+		name: "pi_custom_action",
+		description: "Perform custom action",
+		promptGuidelines: [],
+		sourceInfo: { source: "test" },
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			executedWith = params;
+			return { content: [{ type: "text", text: `Success: ${params.foo}` }] };
+		},
+	};
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: "{}" }],
+	}), [customTool], { adaptive: { softRouting: false } });
+
+	const callToolDef = harness.registeredToolDefs.get("call_tool");
+	assert.ok(callToolDef, "call_tool should be registered");
+
+	const res = await callToolDef.execute("call-1", { tool: "pi_custom_action", parameters: { foo: "bar" } }, undefined, undefined, harness.ctx);
+	assert.equal(executedWith?.foo, "bar");
+	assert.equal(res.content[0].text, "Success: bar");
+});
+
+test("promptDiet removes Pi default 'Use bash for file operations like ls, rg, find' guideline", async () => {
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: "{}" }],
+	}));
+	const messyPrompt = `Available tools:\n- bash\n\nGuidelines:\n- Use bash for file operations like ls, rg, find, etc.\n- Do other stuff.`;
+	const result = await harness.emit("before_agent_start", { systemPrompt: messyPrompt, prompt: "do something" }, harness.ctx);
+	assert.doesNotMatch(result.systemPrompt, /Use bash for file operations like ls, rg, find/i);
 });
 
 test.after(() => rmSync(testHome, { recursive: true, force: true }));

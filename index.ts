@@ -56,8 +56,30 @@ export interface PromptDietConfig {
 }
 
 const turnRoutingHints = new Map<string, string>();
+const CALL_TOOL = "call_tool";
 const REQUEST_CAPABILITIES_TOOL = "request_capabilities";
-const DEFAULT_REQUIRED_TOOLS = ["read", "bash", "edit", "write"];
+
+// Expanded core baseline: essential operations, surgical edit, FFF search, async tasks, subagents, and user dialog
+const DEFAULT_REQUIRED_TOOLS = [
+	"read",
+	"write",
+	"bash",
+	// Hashline edit & standard edit
+	"edit",
+	"replace",
+	"insert",
+	"undo",
+	// Search tools (FFF & ripgrep)
+	"find",
+	"grep",
+	// Background task management
+	"bg_run",
+	"bg_status",
+	// Multi-agent orchestration
+	"subagent",
+	// Structured questioning
+	"ask_user_question",
+];
 
 function unique(values: Iterable<string>): string[] {
 	return [...new Set(values)];
@@ -92,24 +114,32 @@ function rewriteAvailableTools(
 		.map((t) => `- ${t.name}: ${t.description.split("\n")[0].slice(0, 160)}`);
 
 	const inactiveNames = allTools
-		.filter((t) => !activeTools.has(t.name) && t.name !== REQUEST_CAPABILITIES_TOOL)
+		.filter((t) => !activeTools.has(t.name) && t.name !== REQUEST_CAPABILITIES_TOOL && t.name !== CALL_TOOL)
 		.map((t) => t.name);
 
 	let section = `Available tools:\n${activeLines.join("\n")}`;
 	if (inactiveNames.length > 0) {
-		section += `\n\nInactive tools (names only; call ${REQUEST_CAPABILITIES_TOOL} with its name to activate and view documentation):\n${inactiveNames.join(", ")}`;
+		section += `\n\nInactive tools (names only; call ${CALL_TOOL} with its name and parameters to execute directly in 1 turn, or ${REQUEST_CAPABILITIES_TOOL} to activate):\n${inactiveNames.join(", ")}`;
 	}
 
 	return prompt.slice(0, start) + section + prompt.slice(end);
 }
 
 const DEFAULT_CORE_GUIDELINES = [
-	"- Use read to examine files instead of cat or sed.",
-	"- Use edit for precise changes (edits[].oldText must match exactly).",
-	"- When changing multiple separate locations in one file, use one edit call with multiple entries.",
-	"- Keep edits[].oldText as small as possible while still unique; do not pad with large unchanged regions.",
-	"- Use write only for new files or complete rewrites.",
-	"- Rely on each tool's parameter schema or read skills on demand for advanced workflows.",
+	"- Search Discipline: Use find for path search and grep / ast_grep_search for content search. NEVER use bash find, grep, cat, sed, head, or tail to search or inspect files.",
+	"- File Reading: Use read to inspect files (specify offset and limit when dealing with large files).",
+	"- File Editing: If replace is available (pi-hashline-edit-pro), use replace with unique line-hash anchors (remove_from, remove_to, replacement_lines) for surgical changes. If using edit, edits[].oldText must match uniquely and exactly. NEVER rewrite entire files.",
+	"- File Creation: Use write only for brand new files or complete intended overwrites.",
+	"- Long-Running Commands: For tasks that may take more than 5 seconds (builds, test suites, servers, heavy migrations), use bg_run and track progress with bg_status / bg_logs instead of blocking the main thread in bash.",
+	"- Subagent Delegation: For complex, exploratory, or multi-perspective tasks, delegate to specialized subagents via the subagent tool:",
+	"  • scout (fast local codebase reconnaissance, entry points, architecture & risk analysis)",
+	"  • researcher (web/docs research with grounded citations)",
+	"  • worker (focused code implementation & test verification)",
+	"  • reviewer (rigorous code review, edge cases, test coverage)",
+	"  • oracle (deep reasoning, architecture critique, challenging assumptions)",
+	"  • delegate (general-purpose autonomous delegation)",
+	"- Interactive Clarification: When requirements or designs are ambiguous, call ask_user_question to render structured options rather than guessing.",
+	"- Inactive Tools: Any tool listed under Inactive tools can be called directly in a single turn via call_tool(tool, parameters) without prior activation.",
 	"- Be concise in your responses and show file paths clearly.",
 ];
 
@@ -260,6 +290,47 @@ export default function promptDiet(pi: ExtensionAPI) {
 
 	if (typeof (pi as any).registerTool === "function") {
 		(pi as any).registerTool({
+			name: CALL_TOOL,
+			label: "Call Inactive Tool",
+			description: "Directly invoke any registered tool (including inactive or extension tools) in a single turn without waiting for pre-activation. Supply the tool name and arguments.",
+			promptSnippet: "Call any registered tool directly in one turn",
+			parameters: {
+				type: "object",
+				properties: {
+					tool: { type: "string", description: "The exact name of the tool to execute" },
+					parameters: { type: "object", description: "Arguments/parameters to pass to the tool", additionalProperties: true },
+				},
+				required: ["tool", "parameters"],
+				additionalProperties: false,
+			} as any,
+			async execute(toolCallId: string, params: { tool: string; parameters?: Record<string, unknown> }, signal: any, onUpdate: any, ctx: ExtensionContext) {
+				const allTools = pi.getAllTools();
+				const target = allTools.find((t) => t.name === params.tool);
+				if (!target) {
+					const inactiveNames = allTools.filter((t) => !pi.getActiveTools().includes(t.name)).map((t) => t.name);
+					return {
+						content: [{ type: "text", text: `Tool "${params.tool}" not found in registered tools. Available registered tools: ${inactiveNames.join(", ")}` }],
+						isError: true,
+					};
+				}
+				const currentActive = pi.getActiveTools();
+				if (!currentActive.includes(params.tool)) {
+					try {
+						pi.setActiveTools(unique([...currentActive, params.tool]));
+					} catch {}
+				}
+				try {
+					return await target.execute(toolCallId, params.parameters ?? {}, signal, onUpdate, ctx);
+				} catch (err: any) {
+					return {
+						content: [{ type: "text", text: `Error calling tool "${params.tool}": ${err?.message || String(err)}` }],
+						isError: true,
+					};
+				}
+			},
+		});
+
+		(pi as any).registerTool({
 			name: REQUEST_CAPABILITIES_TOOL,
 			label: "Request Capabilities",
 			description: "Dynamically activate an inactive tool or skill when required. Supplies full usage documentation immediately upon activation.",
@@ -282,7 +353,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 
 				const addedTools = requestedTools.filter((t) => allTools.some((at) => at.name === t) && !current.includes(t));
 				if (addedTools.length > 0) {
-					pi.setActiveTools(unique([...current, ...addedTools, REQUEST_CAPABILITIES_TOOL]));
+					pi.setActiveTools(unique([...current, ...addedTools, CALL_TOOL, REQUEST_CAPABILITIES_TOOL]));
 				}
 
 				const toolDocs = allTools
@@ -488,7 +559,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 		if (isContinuation) {
 			preflightSucceeded = true;
 			routedTools = typeof (pi as any).getActiveTools === "function"
-				? (pi as any).getActiveTools().filter((t: string) => t !== REQUEST_CAPABILITIES_TOOL)
+				? (pi as any).getActiveTools().filter((t: string) => t !== REQUEST_CAPABILITIES_TOOL && t !== CALL_TOOL)
 				: allTools.map((t) => t.name);
 			routedSkills = rawSkills.map((s) => s.name);
 			needDocs = true;
@@ -519,6 +590,15 @@ If the user's request explicitly or implicitly references past work, historical 
 
 SPECIAL BROWSER & AUTOMATION RULE:
 If the user's task mentions browser operations, web pages, browser profiles, or UI interaction (e.g., '浏览器', '网页', 'profile', 'profiles', 'browser', 'GUI', 'desktop'), include relevant browser/automation skills (e.g., 'ego-browser', 'cua-driver') if present in the catalog.
+
+SPECIAL SUBAGENT RULE:
+If the user's task involves delegation, code review, secondary opinions, deep reconnaissance, multi-agent workflows, or mentions subagent roles ('subagent', 'scout', 'reviewer', 'worker', 'oracle', 'delegate', 'review', '审查', '第二意见', '子代理'), you MUST include 'subagent' in focus_tools if present in the catalog.
+
+SPECIAL SEARCH & DISCOVERY RULE:
+If the task involves finding files, locating code symbols, AST searching, or grepping ('find', 'grep', 'search', '定位', '查找', '搜'), include 'find', 'grep', 'ast_grep_search', and/or 'symbol_search' in focus_tools if present in the catalog.
+
+SPECIAL BACKGROUND TASKS RULE:
+If the task involves running servers, background jobs, test suites, builds, or long-running processes ('bg_run', 'background', '后台', '长命令', '启动服务'), include 'bg_run' and/or 'bg_status' in focus_tools if present in the catalog.
 
 SPECIAL DOCS RULE:
 If the user's task asks about or involves the Pi coding agent framework itself (e.g. its SDK, extensions, themes, skills, CLI flags, internal APIs, or subprocess testing), set need_docs to true. Otherwise set need_docs to false.`;
@@ -617,6 +697,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 		const activeToolNames = unique([
 			...DEFAULT_REQUIRED_TOOLS,
 			...routedTools,
+			CALL_TOOL,
 			REQUEST_CAPABILITIES_TOOL,
 		]).filter((name) => allTools.some((t) => t.name === name));
 
@@ -669,6 +750,10 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 			const slimText = `Guidelines:\n${allGuidelines.join("\n")}`;
 			prompt = prompt.slice(0, guidelinesStart) + slimText + prompt.slice(nextSectionStart);
 		}
+
+		// Neutralize Pi's conflicting default "Use bash for file operations like ls, rg, find"
+		prompt = prompt.replace(/Use bash for file operations like ls, rg, find[^\n]*/gi, "");
+		prompt = prompt.replace(/Use bash for file operations[^\n]*/gi, "");
 
 		// 文档按需提供：如果未命中 Docs 需求且用户未显式提及框架，将文档段落移出 Prompt
 		const explicitDocsMentioned = /\b(pi|pi-coding-agent|extension|extensions|sdk|skill|skills|theme|themes|tui)\b/i.test(event.prompt);
