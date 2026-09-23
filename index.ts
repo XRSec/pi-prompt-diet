@@ -73,6 +73,15 @@ const CAPABILITY_STATE_ENTRY = "pi-prompt-diet-capabilities";
 const REQUEST_CAPABILITIES_TOOL = "request_capabilities";
 const PURE_CONTINUATIONS = new Set(["继续", "继续做", "再试一次", "好的", "可以", "continue", "go on", "try again"]);
 
+// [fork.1] stale-ctx guard: after a session replacement (newSession/fork/switchSession/reload)
+// the host invalidates our old extension runtime, so resuming async work on it throws the
+// "extension ctx is stale" error. That is NOT an actionable error for prompt-diet — routing is
+// merely skipped for that turn and capabilities stay as-is. We treat it as benign: skip silently
+// instead of spamming logs. This preserves adaptive routing entirely; it only silences the stale noise.
+function isStaleCtxError(error: unknown): boolean {
+	return error instanceof Error && /extension ctx is stale|stale after session replacement/i.test(error.message);
+}
+
 function emptyCapabilityState(): SessionCapabilityState {
 	return {
 		version: 1,
@@ -575,6 +584,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 						saveSkillCapsule(skillCache, skill.filePath, capsule.fingerprint);
 					}
 				} catch (error) {
+					if (isStaleCtxError(error)) return; // [fork.1] session replaced mid-distill; stay silent
 					console.warn(`[pi-prompt-diet] Failed to distill ${skill.name}:`, error);
 				}
 			}
@@ -594,6 +604,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 					toolGuidelineCache.tools[key] = capsule;
 					saveToolGuidelineCapsule(toolGuidelineCache, key, tool);
 				} catch (error) {
+					if (isStaleCtxError(error)) return; // [fork.1] session replaced mid-distill; stay silent
 					console.warn(`[pi-prompt-diet] Failed to distill guidelines for ${tool.name}:`, error);
 				}
 			}
@@ -688,6 +699,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 					routingSucceeded = true;
 				}
 			} catch (error) {
+				if (isStaleCtxError(error)) return; // [fork.1] session replaced mid-routing; stay silent
 				console.warn("[pi-prompt-diet] Incremental capability routing failed; preserving current capabilities:", error);
 			}
 		}
@@ -698,6 +710,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 				pi.setActiveTools(nextTools);
 				capabilityState.lastAppliedTools = nextTools;
 			} catch (error) {
+				if (isStaleCtxError(error)) return; // [fork.1] session replaced mid-preserve; stay silent
 				console.warn("[pi-prompt-diet] Failed to preserve externally activated tools:", error);
 			}
 		}
