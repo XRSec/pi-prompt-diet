@@ -479,4 +479,118 @@ test("preflight routing matches provider case-insensitively", async () => {
 	assert.ok(res.systemPrompt);
 });
 
+test("promptDiet correctly trims XML sections (<tools>, <rules>, <docs>, <skills>) in modern Pi v0.87+", async () => {
+	const xmlSystemPrompt = `<tools>
+- read: Read a file
+- web_search: Search current facts
+- edit: Edit files
+</tools>
+
+<rules>
+- Use bash for file operations like ls, rg, find
+- Subagent Delegation: Delegate when needed
+- Unrelated rule from third-party extension
+</rules>
+
+<docs>
+Pi documentation (read only when user asks about pi):
+- README.md
+</docs>
+
+<skills>
+The following skills provide specialized instructions.
+<available_skills>
+  <skill>
+    <name>dummy-skill</name>
+    <description>A dummy skill</description>
+  </skill>
+</available_skills>
+</skills>`;
+
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: '{"focus_tools":["read"],"focus_skills":[],"need_docs":false}' }],
+	}), [], { adaptive: { softRouting: true } });
+
+	const res = await harness.emit("before_agent_start", {
+		systemPrompt: xmlSystemPrompt,
+		prompt: "echo test",
+		systemPromptOptions: {
+			skills: [{ name: "dummy-skill", description: "A dummy skill", filePath: "/path/to/dummy" }],
+			promptGuidelines: ["Unrelated rule from third-party extension"],
+		}
+	}, harness.ctx);
+
+	// 1. <tools> section should be rewritten with inactive tools notice
+	assert.match(res.systemPrompt, /<tools>/);
+	assert.match(res.systemPrompt, /Inactive tools \(names only;/);
+
+	// 2. <rules> section should be trimmed of third-party rules and bash conflict
+	assert.match(res.systemPrompt, /<rules>/);
+	assert.doesNotMatch(res.systemPrompt, /Unrelated rule from third-party extension/);
+	assert.doesNotMatch(res.systemPrompt, /Use bash for file operations like ls, rg, find/);
+
+	// 3. Since 'echo test' doesn't have subagent active, subagent delegation rules should be omitted
+	assert.doesNotMatch(res.systemPrompt, /Subagent Delegation:/);
+
+	// 4. <docs> section should be completely removed since needDocs is false
+	assert.doesNotMatch(res.systemPrompt, /<docs>/);
+	assert.doesNotMatch(res.systemPrompt, /Pi documentation/);
+
+	// 5. Since no skills are needed, outer <skills> should collapse to inactive notice
+	assert.match(res.systemPrompt, /Inactive skills \(names only;/);
+	assert.doesNotMatch(res.systemPrompt, /The following skills provide specialized instructions/);
+});
+
+test("tool result scrubbing condenses historical large tool outputs but protects recent turns and errors", async () => {
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: "{}" }] }));
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+
+	// Generate 100 lines of mock tool output (>2500 chars)
+	const bigOutput = Array.from({ length: 100 }, (_, i) => `Line ${i + 1}: ${"data ".repeat(10)}`).join("\n");
+	assert.ok(bigOutput.length > 2500);
+
+	const messages = [
+		// Turn 1 (Historical) - user + assistant + toolResult (big)
+		{ role: "user", content: [{ type: "text", text: "Find all files" }] },
+		{ role: "assistant", content: [{ type: "toolCall", toolName: "grep", toolCallId: "call-1" }] },
+		{ role: "toolResult", toolName: "grep", toolCallId: "call-1", isError: false, content: [{ type: "text", text: bigOutput }] },
+
+		// Turn 2 (Historical) - user + assistant + toolResult (error! should NEVER be scrubbed)
+		{ role: "user", content: [{ type: "text", text: "Try reading missing file" }] },
+		{ role: "assistant", content: [{ type: "toolCall", toolName: "read", toolCallId: "call-2" }] },
+		{ role: "toolResult", toolName: "read", toolCallId: "call-2", isError: true, content: [{ type: "text", text: bigOutput }] },
+
+		// Turn 3 (Recent) - user + assistant + toolResult (big, but within safe window of recent turns)
+		{ role: "user", content: [{ type: "text", text: "Read main file" }] },
+		{ role: "assistant", content: [{ type: "toolCall", toolName: "read", toolCallId: "call-3" }] },
+		{ role: "toolResult", toolName: "read", toolCallId: "call-3", isError: false, content: [{ type: "text", text: bigOutput }] },
+
+		// Turn 4 (Current) - user message
+		{ role: "user", content: [{ type: "text", text: "What do you see?" }] },
+	];
+
+	const res = await harness.emit("context", { messages }, harness.ctx);
+	const resMessages = res.messages;
+
+	// 1. Turn 1 toolResult (index 2): historical & > 1200 chars -> scrubbed!
+	const scrubbedT1 = resMessages[2].content[0].text;
+	assert.ok(scrubbedT1.length < bigOutput.length);
+	assert.match(scrubbedT1, /\[pi-prompt-diet: \d+ lines \(~\d+ chars\) of historical grep output scrubbed to preserve context\]/);
+	assert.ok(scrubbedT1.startsWith("Line 1:"));
+	assert.ok(scrubbedT1.endsWith("Line 100: data data data data data data data data data data "));
+
+	// 2. Turn 2 toolResult (index 5): historical & isError: true -> NOT scrubbed!
+	const errorT2 = resMessages[5].content[0].text;
+	assert.equal(errorT2, bigOutput, "Error results must never be scrubbed");
+
+	// 3. Turn 3 toolResult (index 8): recent (within safe window) -> NOT scrubbed!
+	const recentT3 = resMessages[8].content[0].text;
+	assert.equal(recentT3, bigOutput, "Recent turn tool results within safe window must remain intact");
+
+	// 4. Command reports scrubbed stats
+	const statusOutput = await harness.executeCommand("pi-prompt-diet");
+	assert.match(statusOutput, /Scrubbed Tool Results: 1 items/);
+});
+
 test.after(() => rmSync(testHome, { recursive: true, force: true }));

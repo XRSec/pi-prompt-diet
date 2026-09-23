@@ -41,8 +41,17 @@ export interface PackageOverrideConfig {
 	maxDescriptionLength?: number;
 }
 
+export interface ToolResultScrubbingConfig {
+	enabled?: boolean;
+	maxChars?: number;
+	keepRecentTurns?: number;
+}
+
 export interface PromptDietConfig {
 	enabled?: boolean;
+	showNotices?: boolean;
+	requiredTools?: string[];
+	toolResultScrubbing?: ToolResultScrubbingConfig;
 	guidelines?: {
 		mode?: TreatmentMode;      // 全局默认: "slim" | "strip" | "full"
 		customCore?: string[];     // 自定义核心 7 准则
@@ -59,25 +68,56 @@ const turnRoutingHints = new Map<string, string>();
 const CALL_TOOL = "call_tool";
 const REQUEST_CAPABILITIES_TOOL = "request_capabilities";
 
-// Expanded core baseline: essential operations, surgical edit, FFF search, async tasks, and user dialog.
-// Multi-agent orchestration ('subagent') is dynamically activated via soft routing when needed.
+interface SessionStats {
+	promptInitialChars: number;
+	promptSlimmedChars: number;
+	scrubbedToolResultsCount: number;
+	scrubbedSavedChars: number;
+}
+
+const sessionStatsMap = new Map<string, SessionStats>();
+
+function getOrCreateSessionStats(sessionId: string): SessionStats {
+	let s = sessionStatsMap.get(sessionId);
+	if (!s) {
+		s = {
+			promptInitialChars: 0,
+			promptSlimmedChars: 0,
+			scrubbedToolResultsCount: 0,
+			scrubbedSavedChars: 0,
+		};
+		sessionStatsMap.set(sessionId, s);
+	}
+	return s;
+}
+
+function notifyDiet(
+	ctx: ExtensionContext,
+	message: string,
+	level: "info" | "warning" | "error" = "info"
+) {
+	if ((ctx as any)?.hasUI && (ctx as any).ui?.notify) {
+		(ctx as any).ui.notify(message, level);
+	}
+	if (!(ctx as any)?.hasUI || process.env.DEBUG) {
+		console.error(message);
+	}
+}
+
+function updateDietStatus(ctx: ExtensionContext, text: string | undefined) {
+	if ((ctx as any)?.hasUI && typeof (ctx as any).ui?.setStatus === "function") {
+		(ctx as any).ui.setStatus("pi-prompt-diet", text);
+	}
+}
+
+// Lean primitive baseline: read, write, bash, edit.
+// Advanced capabilities (replace/hashline, find/grep, bg_run, subagent)
+// are dynamically activated on-demand via semantic preflight routing or call_tool.
 const DEFAULT_REQUIRED_TOOLS = [
 	"read",
 	"write",
 	"bash",
-	// Hashline edit & standard edit
 	"edit",
-	"replace",
-	"insert",
-	"undo",
-	// Search tools (FFF & ripgrep)
-	"find",
-	"grep",
-	// Background task management
-	"bg_run",
-	"bg_status",
-	// Structured questioning
-	"ask_user_question",
 ];
 
 function unique(values: Iterable<string>): string[] {
@@ -103,11 +143,6 @@ function rewriteAvailableTools(
 	activeTools: Set<string>,
 	allTools: ReturnType<ExtensionAPI["getAllTools"]>,
 ): string {
-	const start = prompt.indexOf("Available tools:\n");
-	if (start === -1) return prompt;
-	const end = prompt.indexOf("\n\nGuidelines:", start);
-	if (end === -1) return prompt;
-
 	const activeLines = allTools
 		.filter((t) => activeTools.has(t.name))
 		.map((t) => `- ${t.name}: ${t.description.split("\n")[0].slice(0, 160)}`);
@@ -116,12 +151,30 @@ function rewriteAvailableTools(
 		.filter((t) => !activeTools.has(t.name) && t.name !== REQUEST_CAPABILITIES_TOOL && t.name !== CALL_TOOL)
 		.map((t) => t.name);
 
-	let section = `Available tools:\n${activeLines.join("\n")}`;
-	if (inactiveNames.length > 0) {
-		section += `\n\nInactive tools (names only; call ${CALL_TOOL} with its name and parameters to execute directly in 1 turn, or ${REQUEST_CAPABILITIES_TOOL} to activate):\n${inactiveNames.join(", ")}`;
+	const xmlStart = prompt.indexOf("<tools>");
+	const xmlEnd = prompt.indexOf("</tools>");
+	if (xmlStart !== -1 && xmlEnd !== -1) {
+		let section = `<tools>\n${activeLines.join("\n")}`;
+		if (inactiveNames.length > 0) {
+			section += `\n\nInactive tools (names only; call ${CALL_TOOL} with its name and parameters to execute directly in 1 turn, or ${REQUEST_CAPABILITIES_TOOL} to activate):\n${inactiveNames.join(", ")}`;
+		}
+		section += `\n</tools>`;
+		return prompt.slice(0, xmlStart) + section + prompt.slice(xmlEnd + "</tools>".length);
 	}
 
-	return prompt.slice(0, start) + section + prompt.slice(end);
+	const start = prompt.indexOf("Available tools:\n");
+	if (start !== -1) {
+		const end = prompt.indexOf("\n\nGuidelines:", start);
+		if (end !== -1) {
+			let section = `Available tools:\n${activeLines.join("\n")}`;
+			if (inactiveNames.length > 0) {
+				section += `\n\nInactive tools (names only; call ${CALL_TOOL} with its name and parameters to execute directly in 1 turn, or ${REQUEST_CAPABILITIES_TOOL} to activate):\n${inactiveNames.join(", ")}`;
+			}
+			return prompt.slice(0, start) + section + prompt.slice(end);
+		}
+	}
+
+	return prompt;
 }
 
 const DEFAULT_CORE_GUIDELINES = [
@@ -144,6 +197,12 @@ const DEFAULT_CORE_GUIDELINES = [
 
 const DEFAULT_CONFIG: PromptDietConfig = {
 	enabled: true,
+	showNotices: true,
+	toolResultScrubbing: {
+		enabled: true,
+		maxChars: 1200,
+		keepRecentTurns: 2,
+	},
 	guidelines: {
 		mode: "slim",
 	},
@@ -186,6 +245,9 @@ function mergeConfig(base: PromptDietConfig, next: PromptDietConfig): PromptDiet
 	return {
 		...base,
 		...next,
+		showNotices: next.showNotices ?? base.showNotices,
+		requiredTools: next.requiredTools ?? base.requiredTools,
+		toolResultScrubbing: { ...base.toolResultScrubbing, ...(next.toolResultScrubbing || {}) },
 		guidelines: { ...base.guidelines, ...(next.guidelines || {}) },
 		skills: { ...base.skills, ...(next.skills || {}) },
 		adaptive: { ...base.adaptive, ...(next.adaptive || {}) },
@@ -283,9 +345,60 @@ function matchSkillRule(skillPath: string, skillName: string, rules: string[]): 
 	return "none";
 }
 
-function selectedCoreGuidelines(customCore: string[] | undefined): string[] {
+function selectedCoreGuidelines(
+	customCore: string[] | undefined,
+	activeToolsOrHasSubagent: Set<string> | boolean = false,
+): string[] {
 	if (customCore) return customCore;
-	return DEFAULT_CORE_GUIDELINES;
+
+	if (typeof activeToolsOrHasSubagent === "boolean") {
+		if (activeToolsOrHasSubagent) return DEFAULT_CORE_GUIDELINES;
+		return DEFAULT_CORE_GUIDELINES.filter((g) => !g.startsWith("- Subagent Delegation:"));
+	}
+
+	const active = activeToolsOrHasSubagent;
+	const lines: string[] = [];
+
+	if (active.has("find") || active.has("grep") || active.has("ast_grep_search")) {
+		lines.push("- Search Discipline: Use find for path search and grep / ast_grep_search for content search. NEVER use bash find, grep, cat, sed, head, or tail to search or inspect files.");
+	}
+
+	if (active.has("read")) {
+		lines.push("- File Reading: Use read to inspect files (specify offset and limit when dealing with large files).");
+	}
+
+	if (active.has("replace")) {
+		lines.push("- File Editing: If replace is available (pi-hashline-edit-pro), use replace with unique line-hash anchors (remove_from, remove_to, replacement_lines) for surgical changes. If using edit, edits[].oldText must match uniquely and exactly. NEVER rewrite entire files.");
+	} else if (active.has("edit")) {
+		lines.push("- File Editing: If using edit, edits[].oldText must match uniquely and exactly. NEVER rewrite entire files.");
+	}
+
+	if (active.has("write")) {
+		lines.push("- File Creation: Use write only for brand new files or complete intended overwrites.");
+	}
+
+	if (active.has("bg_run")) {
+		lines.push("- Long-Running Commands: For tasks that may take more than 5 seconds (builds, test suites, servers, heavy migrations), use bg_run and track progress with bg_status / bg_logs instead of blocking the main thread in bash.");
+	}
+
+	if (active.has("subagent")) {
+		lines.push("- Subagent Delegation: For complex, exploratory, or multi-perspective tasks, delegate to specialized subagents via the subagent tool:");
+		lines.push("  • scout (fast local codebase reconnaissance, entry points, architecture & risk analysis)");
+		lines.push("  • researcher (web/docs research with grounded citations)");
+		lines.push("  • worker (focused code implementation & test verification)");
+		lines.push("  • reviewer (rigorous code review, edge cases, test coverage)");
+		lines.push("  • oracle (deep reasoning, architecture critique, challenging assumptions)");
+		lines.push("  • delegate (general-purpose autonomous delegation)");
+	}
+
+	if (active.has("ask_user_question")) {
+		lines.push("- Interactive Clarification: When requirements or designs are ambiguous, call ask_user_question to render structured options rather than guessing.");
+	}
+
+	lines.push("- Inactive Tools: Any tool listed under Inactive tools can be called directly in a single turn via call_tool(tool, parameters) without prior activation.");
+	lines.push("- Be concise in your responses and show file paths clearly.");
+
+	return lines;
 }
 
 function truncateDescription(description: string, maxLength: number): string {
@@ -341,6 +454,10 @@ export default function promptDiet(pi: ExtensionAPI) {
 				if (!currentActive.includes(params.tool)) {
 					try {
 						pi.setActiveTools(unique([...currentActive, params.tool]));
+						const config = loadConfig(ctx.cwd);
+						if (config.showNotices !== false) {
+							notifyDiet(ctx, `⚡ [pi-prompt-diet] 即时调用非活跃工具: ${params.tool}`, "info");
+						}
 					} catch {}
 				}
 				try {
@@ -380,6 +497,16 @@ export default function promptDiet(pi: ExtensionAPI) {
 					pi.setActiveTools(unique([...current, ...addedTools, CALL_TOOL, REQUEST_CAPABILITIES_TOOL]));
 				}
 
+				if (addedTools.length > 0 || requestedSkills.length > 0) {
+					const config = loadConfig(_ctx.cwd);
+					if (config.showNotices !== false) {
+						const caps: string[] = [];
+						if (addedTools.length > 0) caps.push(`工具 [${addedTools.join(", ")}]`);
+						if (requestedSkills.length > 0) caps.push(`技能 [${requestedSkills.join(", ")}]`);
+						notifyDiet(_ctx, `⚡ [pi-prompt-diet] 按需激活: ${caps.join("，")}`, "info");
+					}
+				}
+
 				const toolDocs = allTools
 					.filter((t) => addedTools.includes(t.name))
 					.map((t) => `### Tool: ${t.name}\n${t.description}`);
@@ -409,21 +536,42 @@ export default function promptDiet(pi: ExtensionAPI) {
 
 	if (typeof (pi as any).registerCommand === "function") {
 		(pi as any).registerCommand("pi-prompt-diet", {
-			description: "Inspect Prompt Diet distillation cache status",
+			description: "Inspect Prompt Diet status, active tools, and saved tokens",
 			handler: async (_args: string, _ctx: ExtensionContext) => {
 				const allTools = pi.getAllTools();
 				const activeTools = pi.getActiveTools();
+				const inactiveTools = allTools.filter((t) => !activeTools.includes(t.name) && t.name !== REQUEST_CAPABILITIES_TOOL && t.name !== CALL_TOOL);
 				const skillCapsulesCount = Object.keys(skillCache.skills).length;
 				const toolCapsulesCount = Object.keys(toolGuidelineCache.tools).length;
+				const sessionKey = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
+				const stats = sessionStatsMap.get(sessionKey);
+
 				const lines = [
 					"=== pi-prompt-diet Status ===",
-					`• Total Tools: ${allTools.length}`,
-					`• Active Tools: ${activeTools.length}`,
-					`• Known Skills: ${knownSkills.size}`,
+					`• Total Tools: ${allTools.length} (${activeTools.length} active, ${inactiveTools.length} on-demand)`,
+					`• Active Tools: ${activeTools.join(", ")}`,
+				];
+				if (inactiveTools.length > 0) {
+					lines.push(`• On-demand Tools: ${inactiveTools.map((t) => t.name).join(", ")}`);
+				}
+				lines.push(`• Known Skills: ${knownSkills.size}`);
+				if (stats && stats.promptInitialChars > 0) {
+					const saved = stats.promptInitialChars - stats.promptSlimmedChars;
+					if (saved > 0) {
+						const pct = Math.round((saved / stats.promptInitialChars) * 100);
+						lines.push(`• System Prompt: ${(stats.promptInitialChars / 1024).toFixed(1)}KB ➔ ${(stats.promptSlimmedChars / 1024).toFixed(1)}KB (-${pct}%, ~${Math.round(saved / 4)} tokens saved)`);
+					} else {
+						lines.push(`• System Prompt: ${(stats.promptSlimmedChars / 1024).toFixed(1)}KB`);
+					}
+				}
+				if (stats && stats.scrubbedSavedChars > 0) {
+					lines.push(`• Scrubbed Tool Results: ${stats.scrubbedToolResultsCount} items, ${(stats.scrubbedSavedChars / 1024).toFixed(1)}KB saved (~${Math.round(stats.scrubbedSavedChars / 4)} tokens)`);
+				}
+				lines.push(
 					`• Skill Capsules in Cache: ${skillCapsulesCount}`,
 					`• Tool Guideline Capsules in Cache: ${toolCapsulesCount}`,
 					"==============================",
-				];
+				);
 				const output = lines.join("\n");
 				if ((_ctx as any).ui?.notify) {
 					(_ctx as any).ui.notify(output);
@@ -441,25 +589,93 @@ export default function promptDiet(pi: ExtensionAPI) {
 		knownSkills.clear();
 		pendingDistillation.clear();
 		pendingToolDistillation.clear();
+		const sessionKey = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
+		sessionStatsMap.delete(sessionKey);
 	});
 
 	pi.on("context", async (event, _ctx) => {
+		const cwd = _ctx.cwd || process.cwd();
+		const config = loadConfig(cwd);
+		if (config.enabled === false) return { messages: event.messages };
+
+		let currentMessages = event.messages;
+
+		// ── 1. Tool Result Scrubbing (历史工具超大输出滑动衰减) ───────────────
+		const scrubConfig = config.toolResultScrubbing ?? {};
+		if (scrubConfig.enabled !== false && Array.isArray(currentMessages)) {
+			const keepTurns = scrubConfig.keepRecentTurns ?? 2;
+			const safeWindowCount = Math.max(4, keepTurns * 2 + 2);
+			const maxChars = scrubConfig.maxChars ?? 1200;
+
+			let scrubbedCount = 0;
+			let savedChars = 0;
+
+			currentMessages = currentMessages.map((m: any, idx: number) => {
+				if (idx >= currentMessages.length - safeWindowCount) return m;
+				if (m.role !== "toolResult" || m.isError) return m;
+
+				if (Array.isArray(m.content)) {
+					let messageModified = false;
+					const newContent = m.content.map((c: any) => {
+						if (c && c.type === "text" && typeof c.text === "string" && c.text.length > maxChars) {
+							const originalLength = c.text.length;
+							const lines = c.text.split("\n");
+							if (lines.length > 8) {
+								const head = lines.slice(0, 6).join("\n");
+								const tail = lines.slice(-2).join("\n");
+								const omittedLines = lines.length - 8;
+								const notice = `\n\n... [pi-prompt-diet: ${omittedLines} lines (~${originalLength - head.length - tail.length} chars) of historical ${m.toolName || "tool"} output scrubbed to preserve context] ...\n\n`;
+								const scrubbedText = head + notice + tail;
+								scrubbedCount++;
+								savedChars += (originalLength - scrubbedText.length);
+								messageModified = true;
+								return { ...c, text: scrubbedText };
+							}
+						}
+						return c;
+					});
+					return messageModified ? { ...m, content: newContent } : m;
+				}
+				return m;
+			});
+
+			if (scrubbedCount > 0) {
+				const sessionName = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
+				const stats = getOrCreateSessionStats(sessionName);
+				stats.scrubbedToolResultsCount += scrubbedCount;
+				stats.scrubbedSavedChars += savedChars;
+
+				if (config.showNotices !== false) {
+					const estTokens = Math.round(savedChars / 4);
+					const scrubMsg = `🧹 [pi-prompt-diet] 历史工具清洗: 压缩 ${scrubbedCount} 个旧工具结果，净省 ${(savedChars / 1024).toFixed(1)}KB (~${estTokens} tokens)`;
+					notifyDiet(_ctx, scrubMsg, "info");
+
+					const promptPercent = stats.promptInitialChars > 0
+						? Math.round(((stats.promptInitialChars - stats.promptSlimmedChars) / stats.promptInitialChars) * 100)
+						: 0;
+					const totalScrubbedKb = (stats.scrubbedSavedChars / 1024).toFixed(0);
+					updateDietStatus(_ctx, `🌿 Diet: -${promptPercent}% | 🧹 累计省 ${totalScrubbedKb}KB`);
+				}
+			}
+		}
+
+		// ── 2. Preflight 语义意图注入 (<system_directive>) ─────────────────
 		const sessionName = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
 		const hint = turnRoutingHints.get(sessionName);
-		if (!hint) return { messages: event.messages };
+		if (!hint) return { messages: currentMessages };
 
-		const lastUserIdx = event.messages.findLastIndex((m: any) => m && m.role === "user");
-		if (lastUserIdx === -1) return { messages: event.messages };
+		const lastUserIdx = currentMessages.findLastIndex((m: any) => m && m.role === "user");
+		if (lastUserIdx === -1) return { messages: currentMessages };
 
-		const lastUser = event.messages[lastUserIdx];
-		if (!Array.isArray(lastUser.content)) return { messages: event.messages };
+		const lastUser = currentMessages[lastUserIdx];
+		if (!Array.isArray(lastUser.content)) return { messages: currentMessages };
 
 		const textIdx = lastUser.content.findIndex((c: any) => c && c.type === "text" && typeof c.text === "string");
-		if (textIdx === -1) return { messages: event.messages };
+		if (textIdx === -1) return { messages: currentMessages };
 
 		const textBlock = lastUser.content[textIdx];
 		if (textBlock.text.startsWith("<system_directive>")) {
-			return { messages: event.messages };
+			return { messages: currentMessages };
 		}
 
 		const newContent = [...lastUser.content];
@@ -468,9 +684,9 @@ export default function promptDiet(pi: ExtensionAPI) {
 			text: `<system_directive>${hint}</system_directive>\n\n${textBlock.text}`,
 		};
 
-		const newMessages = [...event.messages];
-		newMessages[lastUserIdx] = { ...lastUser, content: newContent };
-		return { messages: newMessages };
+		const finalMessages = [...currentMessages];
+		finalMessages[lastUserIdx] = { ...lastUser, content: newContent };
+		return { messages: finalMessages };
 	});
 
 	pi.on("tool_result", (event, ctx) => {
@@ -504,6 +720,9 @@ export default function promptDiet(pi: ExtensionAPI) {
 					if (capsule) {
 						skillCache.skills[skill.filePath] = capsule;
 						saveSkillCapsule(skillCache, skill.filePath, capsule.fingerprint);
+						if (config.showNotices !== false) {
+							notifyDiet(ctx, `✨ [pi-prompt-diet] 技能胶囊已蒸馏沉淀: ${skill.name} (${capsule.essentialRules.length} 条核心约束)`, "info");
+						}
 					}
 				} catch (error) {
 					console.warn(`[pi-prompt-diet] Failed to distill ${skill.name}:`, error);
@@ -524,6 +743,10 @@ export default function promptDiet(pi: ExtensionAPI) {
 					const key = `${capsule.source}:${capsule.name}`;
 					toolGuidelineCache.tools[key] = capsule;
 					saveToolGuidelineCapsule(toolGuidelineCache, key, tool);
+					if (config.showNotices !== false) {
+						const count = capsule.mode === "capsule" ? `${capsule.essentialRules.length} 条准则` : "保留完整";
+						notifyDiet(ctx, `✨ [pi-prompt-diet] 工具准则已蒸馏沉淀: ${tool.name} (${count})`, "info");
+					}
 				} catch (error) {
 					console.warn(`[pi-prompt-diet] Failed to distill guidelines for ${tool.name}:`, error);
 				}
@@ -549,6 +772,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 		knownSkills.clear();
 		for (const skill of rawSkills) knownSkills.set(resolve(skill.filePath), skill);
 
+		const initialPromptLength = event.systemPrompt.length;
 		let prompt = event.systemPrompt;
 
 		// ── 构建 packages 覆盖映射表 ─────────────────────────────────────────
@@ -729,8 +953,12 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 		const explicitSkills = extractExplicitSkills(event.prompt);
 		const neededSkills = new Set([...explicitSkills, ...routedSkills]);
 
+		const baseRequired = Array.isArray(config.requiredTools) && config.requiredTools.length > 0
+			? config.requiredTools
+			: DEFAULT_REQUIRED_TOOLS;
+
 		const activeToolNames = unique([
-			...DEFAULT_REQUIRED_TOOLS,
+			...baseRequired,
 			...routedTools,
 			CALL_TOOL,
 			REQUEST_CAPABILITIES_TOOL,
@@ -747,43 +975,50 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 		prompt = rewriteAvailableTools(prompt, activeToolsSet, allTools);
 
 		// Guidelines 处理：保留核心准则 + 属于活跃工具集的第三方工具准则（或其蒸馏胶囊）
-		const guidelinesStart = prompt.indexOf("Guidelines:\n");
-		if (guidelinesStart !== -1) {
-			const rest = prompt.slice(guidelinesStart + "Guidelines:\n".length);
-			const boundaryMatch = rest.match(/\n\n(?=[<#]|Pi documentation\b|Inactive skills\b)/);
-			const nextSectionStart = boundaryMatch && boundaryMatch.index !== undefined
-				? guidelinesStart + "Guidelines:\n".length + boundaryMatch.index
-				: prompt.length;
+		const core = selectedCoreGuidelines(config.guidelines?.customCore, activeToolsSet);
+		const preservedGuidelines = new Set<string>();
 
-			const core = selectedCoreGuidelines(config.guidelines?.customCore);
-			const preservedGuidelines = new Set<string>();
+		for (const tool of allTools) {
+			if (!activeToolsSet.has(tool.name)) continue;
+			const source = tool.sourceInfo?.source;
+			if (!source || source === "builtin" || source === "sdk") continue;
 
-			for (const tool of allTools) {
-				if (!activeToolsSet.has(tool.name)) continue;
-				const source = tool.sourceInfo?.source;
-				if (!source || source === "builtin" || source === "sdk") continue;
-
-				const toolSource = typeof source === "string" ? normalizeName(source) : "";
-				const toolName = normalizeName(tool.name);
-				const pkgCfg = (toolSource ? overrides.get(toolSource) : undefined) || overrides.get(toolName);
-				const explicitMode = typeof pkgCfg?.guidelines === "object" ? pkgCfg.guidelines.mode : pkgCfg?.guidelines;
-				if (explicitMode === "full") {
-					for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
-					continue;
-				}
-				if (explicitMode === "slim" || explicitMode === "strip") continue;
-
-				const capsule = getValidToolGuidelineCapsule(toolGuidelineCache, tool as CapabilityTool);
-				if (!capsule || capsule.mode === "full") {
-					for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
-				} else {
-					for (const guideline of formatToolGuidelineCapsule(capsule)) preservedGuidelines.add(guideline);
-				}
+			const toolSource = typeof source === "string" ? normalizeName(source) : "";
+			const toolName = normalizeName(tool.name);
+			const pkgCfg = (toolSource ? overrides.get(toolSource) : undefined) || overrides.get(toolName);
+			const explicitMode = typeof pkgCfg?.guidelines === "object" ? pkgCfg.guidelines.mode : pkgCfg?.guidelines;
+			if (explicitMode === "full") {
+				for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
+				continue;
 			}
+			if (explicitMode === "slim" || explicitMode === "strip") continue;
 
-			const allGuidelines = [...core, ...[...preservedGuidelines].map((g) => `- ${g}`)];
-			const slimText = `Guidelines:\n${allGuidelines.join("\n")}`;
-			prompt = prompt.slice(0, guidelinesStart) + slimText + prompt.slice(nextSectionStart);
+			const capsule = getValidToolGuidelineCapsule(toolGuidelineCache, tool as CapabilityTool);
+			if (!capsule || capsule.mode === "full") {
+				for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
+			} else {
+				for (const guideline of formatToolGuidelineCapsule(capsule)) preservedGuidelines.add(guideline);
+			}
+		}
+
+		const allGuidelines = [...core, ...[...preservedGuidelines].map((g) => `- ${g}`)];
+
+		const xmlRulesStart = prompt.indexOf("<rules>");
+		const xmlRulesEnd = prompt.indexOf("</rules>");
+		if (xmlRulesStart !== -1 && xmlRulesEnd !== -1) {
+			const slimText = `<rules>\n${allGuidelines.join("\n")}\n</rules>`;
+			prompt = prompt.slice(0, xmlRulesStart) + slimText + prompt.slice(xmlRulesEnd + "</rules>".length);
+		} else {
+			const guidelinesStart = prompt.indexOf("Guidelines:\n");
+			if (guidelinesStart !== -1) {
+				const rest = prompt.slice(guidelinesStart + "Guidelines:\n".length);
+				const boundaryMatch = rest.match(/\n\n(?=[<#]|Pi documentation\b|Inactive skills\b)/);
+				const nextSectionStart = boundaryMatch && boundaryMatch.index !== undefined
+					? guidelinesStart + "Guidelines:\n".length + boundaryMatch.index
+					: prompt.length;
+				const slimText = `Guidelines:\n${allGuidelines.join("\n")}`;
+				prompt = prompt.slice(0, guidelinesStart) + slimText + prompt.slice(nextSectionStart);
+			}
 		}
 
 		// Neutralize Pi's conflicting default "Use bash for file operations like ls, rg, find"
@@ -792,8 +1027,11 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 
 		// 文档按需提供：如果未命中 Docs 需求且用户未显式提及框架，将文档段落移出 Prompt
 		const explicitDocsMentioned = /\b(pi|pi-coding-agent|extension|extensions|sdk|skill|skills|theme|themes|tui)\b/i.test(event.prompt);
-		if (!needDocs && !explicitDocsMentioned && rawDocsBlock) {
-			prompt = prompt.replace(rawDocsBlock, "");
+		if (!needDocs && !explicitDocsMentioned) {
+			prompt = prompt.replace(/<docs>[\s\S]*?<\/docs>\n*/g, "");
+			if (rawDocsBlock) {
+				prompt = prompt.replace(rawDocsBlock, "");
+			}
 		}
 
 		// Skill 只有在用户明确提及或语境命中时才注入完整/胶囊内容，未命中的列出名字供按需激活
@@ -835,7 +1073,49 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 				slimSkillsSection = slimSkillsSection ? `${slimSkillsSection}\n\n${inactiveNotice}` : inactiveNotice;
 			}
 
-			prompt = prompt.slice(0, skillsStart) + slimSkillsSection + prompt.slice(skillsEnd + "</available_skills>".length);
+			// Check if <available_skills> is wrapped inside <skills>...</skills>
+			const outerSkillsStart = prompt.lastIndexOf("<skills>", skillsStart);
+			const outerSkillsEnd = prompt.indexOf("</skills>", skillsEnd);
+			if (outerSkillsStart !== -1 && outerSkillsEnd !== -1 && outerSkillsStart < skillsStart && outerSkillsEnd > skillsEnd) {
+				if (activeSkillBlocks.length === 0) {
+					const replacement = slimSkillsSection ? `<skills>\n${slimSkillsSection}\n</skills>` : "";
+					prompt = prompt.slice(0, outerSkillsStart) + replacement + prompt.slice(outerSkillsEnd + "</skills>".length);
+				} else {
+					prompt = prompt.slice(0, skillsStart) + slimSkillsSection + prompt.slice(skillsEnd + "</available_skills>".length);
+				}
+			} else {
+				prompt = prompt.slice(0, skillsStart) + slimSkillsSection + prompt.slice(skillsEnd + "</available_skills>".length);
+			}
+		}
+
+		const finalLength = prompt.length;
+		const savedChars = Math.max(0, initialPromptLength - finalLength);
+		const percent = initialPromptLength > 0 ? Math.round((savedChars / initialPromptLength) * 100) : 0;
+		const estTokens = Math.round(savedChars / 4);
+
+		const stats = getOrCreateSessionStats(sessionName);
+		stats.promptInitialChars = initialPromptLength;
+		stats.promptSlimmedChars = finalLength;
+
+		if (config.showNotices !== false) {
+			const activeCount = activeToolNames.length;
+			const totalCount = allTools.length;
+			const routingDetail = routedTools.length > 0 ? `路由: ${routedTools.join(", ")}` : "基线工具";
+			const dietMsg = savedChars > 0
+				? `🌿 [pi-prompt-diet] 提示词精简: ${(initialPromptLength / 1024).toFixed(1)}KB ➔ ${(finalLength / 1024).toFixed(1)}KB (-${percent}%, 估省 ~${estTokens} tokens) | 工具: ${activeCount}/${totalCount} 活跃 (${routingDetail})`
+				: `🌿 [pi-prompt-diet] 提示词装配: ${(finalLength / 1024).toFixed(1)}KB | 工具: ${activeCount}/${totalCount} 活跃 (${routingDetail})`;
+
+			notifyDiet(_ctx, dietMsg, "info");
+			updateDietStatus(_ctx, savedChars > 0 ? `🌿 Diet: -${percent}% (${(finalLength / 1024).toFixed(1)}KB)` : `🌿 Diet: ${(finalLength / 1024).toFixed(1)}KB`);
+		}
+
+		if (process.env.DEBUG) {
+			console.error("[Diet] Final forced system prompt length:", prompt.length);
+			const matches = prompt.match(/<([a-z_]+)>([\s\S]*?)<\/\1>/g) || [];
+			for (const m of matches) {
+				const tag = m.match(/<([a-z_]+)>/)?.[1];
+				console.error(`[Diet] Section <${tag}>: ${m.length} chars`);
+			}
 		}
 
 		return { systemPrompt: prompt };
