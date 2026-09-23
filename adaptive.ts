@@ -448,3 +448,131 @@ export async function distillSkill(
 		generatedAt: new Date().toISOString(),
 	};
 }
+
+export interface SessionStatEntry {
+	promptInitialChars: number;
+	promptSlimmedChars: number;
+	scrubbedToolResultsCount: number;
+	scrubbedSavedChars: number;
+	activeTools?: string[];
+	activeSkills?: string[];
+	needDocs?: boolean;
+	lastUpdated: string;
+}
+
+export interface DietGlobalStats {
+	version: 1;
+	updatedAt: string;
+	totals: {
+		totalPromptInitialChars: number;
+		totalPromptSlimmedChars: number;
+		totalCharsSaved: number;
+		totalTokensSaved: number;
+		totalScrubbedToolResultsCount: number;
+		totalScrubbedSavedChars: number;
+		totalRounds: number;
+	};
+	sessions: Record<string, SessionStatEntry>;
+}
+
+export function globalStatsPath(): string {
+	return join(cacheRoot(), "stats.json");
+}
+
+export function loadGlobalStats(): DietGlobalStats {
+	const file = globalStatsPath();
+	const defaultStats: DietGlobalStats = {
+		version: 1,
+		updatedAt: new Date().toISOString(),
+		totals: {
+			totalPromptInitialChars: 0,
+			totalPromptSlimmedChars: 0,
+			totalCharsSaved: 0,
+			totalTokensSaved: 0,
+			totalScrubbedToolResultsCount: 0,
+			totalScrubbedSavedChars: 0,
+			totalRounds: 0,
+		},
+		sessions: {},
+	};
+
+	if (!existsSync(file)) return defaultStats;
+	try {
+		const parsed = JSON.parse(readFileSync(file, "utf8"));
+		if (parsed?.version === 1 && parsed?.totals) {
+			return {
+				...defaultStats,
+				...parsed,
+				totals: { ...defaultStats.totals, ...parsed.totals },
+				sessions: parsed.sessions || {},
+			};
+		}
+	} catch {
+		// Ignore parse errors on corrupted stats
+	}
+	return defaultStats;
+}
+
+export function loadSessionState(sessionId: string): SessionStatEntry | undefined {
+	const stats = loadGlobalStats();
+	return stats.sessions?.[sessionId];
+}
+
+export function saveSessionState(sessionId: string, patch: Partial<SessionStatEntry>): void {
+	try {
+		const stats = loadGlobalStats();
+		if (!stats.sessions) stats.sessions = {};
+		const existing = stats.sessions[sessionId] || {
+			promptInitialChars: 0,
+			promptSlimmedChars: 0,
+			scrubbedToolResultsCount: 0,
+			scrubbedSavedChars: 0,
+			lastUpdated: new Date().toISOString(),
+		};
+		stats.sessions[sessionId] = {
+			...existing,
+			...patch,
+			lastUpdated: new Date().toISOString(),
+		};
+		// FIFO prune to keep max 50 sessions
+		const keys = Object.keys(stats.sessions);
+		if (keys.length > 50) {
+			delete stats.sessions[keys[0]];
+		}
+		writeJsonAtomic(globalStatsPath(), stats);
+	} catch (err) {
+		console.warn(`[pi-prompt-diet] Failed to save session state:`, err);
+	}
+}
+
+export interface StatsDelta {
+	promptInitialChars?: number;
+	promptSlimmedChars?: number;
+	scrubbedToolResultsCount?: number;
+	scrubbedSavedChars?: number;
+}
+
+export function recordStatsDelta(delta: StatsDelta): void {
+	try {
+		const stats = loadGlobalStats();
+		const initial = delta.promptInitialChars || 0;
+		const slimmed = delta.promptSlimmedChars || 0;
+		const promptSaved = Math.max(0, initial - slimmed);
+		const scrubSaved = delta.scrubbedSavedChars || 0;
+		const totalSaved = promptSaved + scrubSaved;
+		const tokensSaved = Math.round(totalSaved / 4);
+
+		stats.updatedAt = new Date().toISOString();
+		stats.totals.totalPromptInitialChars += initial;
+		stats.totals.totalPromptSlimmedChars += slimmed;
+		stats.totals.totalCharsSaved += totalSaved;
+		stats.totals.totalTokensSaved += tokensSaved;
+		stats.totals.totalScrubbedToolResultsCount += (delta.scrubbedToolResultsCount || 0);
+		stats.totals.totalScrubbedSavedChars += scrubSaved;
+		if (initial > 0 || scrubSaved > 0) stats.totals.totalRounds += 1;
+
+		writeJsonAtomic(globalStatsPath(), stats);
+	} catch (err) {
+		console.warn(`[pi-prompt-diet] Failed to record stats delta:`, err);
+	}
+}

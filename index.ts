@@ -16,6 +16,12 @@ import {
 	loadToolGuidelineCapsuleCache,
 	saveSkillCapsule,
 	saveToolGuidelineCapsule,
+	loadGlobalStats,
+	recordStatsDelta,
+	loadSessionState,
+	saveSessionState,
+	type DietGlobalStats,
+	type SessionStatEntry,
 	type AdaptiveConfig,
 	type CapabilitySkill,
 	type CapabilityTool,
@@ -73,6 +79,13 @@ interface SessionStats {
 	promptSlimmedChars: number;
 	scrubbedToolResultsCount: number;
 	scrubbedSavedChars: number;
+	activeTools?: string[];
+	activeSkills?: string[];
+	needDocs?: boolean;
+}
+
+function getSessionKey(ctx: ExtensionContext): string {
+	return ctx.sessionManager?.getSessionId?.() || ctx.sessionManager?.getSessionName?.() || ctx.cwd || "default";
 }
 
 const sessionStatsMap = new Map<string, SessionStats>();
@@ -80,11 +93,15 @@ const sessionStatsMap = new Map<string, SessionStats>();
 function getOrCreateSessionStats(sessionId: string): SessionStats {
 	let s = sessionStatsMap.get(sessionId);
 	if (!s) {
+		const persistent = loadSessionState(sessionId);
 		s = {
-			promptInitialChars: 0,
-			promptSlimmedChars: 0,
-			scrubbedToolResultsCount: 0,
-			scrubbedSavedChars: 0,
+			promptInitialChars: persistent?.promptInitialChars ?? 0,
+			promptSlimmedChars: persistent?.promptSlimmedChars ?? 0,
+			scrubbedToolResultsCount: persistent?.scrubbedToolResultsCount ?? 0,
+			scrubbedSavedChars: persistent?.scrubbedSavedChars ?? 0,
+			activeTools: persistent?.activeTools,
+			activeSkills: persistent?.activeSkills,
+			needDocs: persistent?.needDocs,
 		};
 		sessionStatsMap.set(sessionId, s);
 	}
@@ -453,7 +470,12 @@ export default function promptDiet(pi: ExtensionAPI) {
 				const currentActive = pi.getActiveTools();
 				if (!currentActive.includes(params.tool)) {
 					try {
-						pi.setActiveTools(unique([...currentActive, params.tool]));
+						const newActive = unique([...currentActive, params.tool]);
+						pi.setActiveTools(newActive);
+						const sessionName = getSessionKey(ctx);
+						const stats = getOrCreateSessionStats(sessionName);
+						stats.activeTools = newActive;
+						saveSessionState(sessionName, { activeTools: newActive });
 						const config = loadConfig(ctx.cwd);
 						if (config.showNotices !== false) {
 							notifyDiet(ctx, `⚡ [pi-prompt-diet] 即时调用非活跃工具: ${params.tool}`, "info");
@@ -494,7 +516,18 @@ export default function promptDiet(pi: ExtensionAPI) {
 
 				const addedTools = requestedTools.filter((t) => allTools.some((at) => at.name === t) && !current.includes(t));
 				if (addedTools.length > 0) {
-					pi.setActiveTools(unique([...current, ...addedTools, CALL_TOOL, REQUEST_CAPABILITIES_TOOL]));
+					const newActive = unique([...current, ...addedTools, CALL_TOOL, REQUEST_CAPABILITIES_TOOL]);
+					pi.setActiveTools(newActive);
+					const sessionName = getSessionKey(_ctx);
+					const stats = getOrCreateSessionStats(sessionName);
+					stats.activeTools = newActive;
+					if (requestedSkills.length > 0) {
+						stats.activeSkills = unique([...(stats.activeSkills || []), ...requestedSkills]);
+					}
+					saveSessionState(sessionName, {
+						activeTools: newActive,
+						activeSkills: stats.activeSkills,
+					});
 				}
 
 				if (addedTools.length > 0 || requestedSkills.length > 0) {
@@ -534,8 +567,13 @@ export default function promptDiet(pi: ExtensionAPI) {
 		});
 	}
 
+function maskSessionId(id: string): string {
+	if (!id || id.length <= 10) return id;
+	return `${id.slice(0, 6)}***${id.slice(-4)}`;
+}
+
 	if (typeof (pi as any).registerCommand === "function") {
-		(pi as any).registerCommand("pi-prompt-diet", {
+		const commandDef = {
 			description: "Inspect Prompt Diet status, active tools, and saved tokens",
 			handler: async (_args: string, _ctx: ExtensionContext) => {
 				const allTools = pi.getAllTools();
@@ -543,11 +581,12 @@ export default function promptDiet(pi: ExtensionAPI) {
 				const inactiveTools = allTools.filter((t) => !activeTools.includes(t.name) && t.name !== REQUEST_CAPABILITIES_TOOL && t.name !== CALL_TOOL);
 				const skillCapsulesCount = Object.keys(skillCache.skills).length;
 				const toolCapsulesCount = Object.keys(toolGuidelineCache.tools).length;
-				const sessionKey = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
-				const stats = sessionStatsMap.get(sessionKey);
+				const sessionKey = getSessionKey(_ctx);
+				const stats = getOrCreateSessionStats(sessionKey);
 
 				const lines = [
 					"=== pi-prompt-diet Status ===",
+					`• Session: ${maskSessionId(sessionKey)}`,
 					`• Total Tools: ${allTools.length} (${activeTools.length} active, ${inactiveTools.length} on-demand)`,
 					`• Active Tools: ${activeTools.join(", ")}`,
 				];
@@ -567,6 +606,10 @@ export default function promptDiet(pi: ExtensionAPI) {
 				if (stats && stats.scrubbedSavedChars > 0) {
 					lines.push(`• Scrubbed Tool Results: ${stats.scrubbedToolResultsCount} items, ${(stats.scrubbedSavedChars / 1024).toFixed(1)}KB saved (~${Math.round(stats.scrubbedSavedChars / 4)} tokens)`);
 				}
+				const globalStats = loadGlobalStats();
+				if (globalStats && globalStats.totals.totalCharsSaved > 0) {
+					lines.push(`• Global Cumulative Saved: ${(globalStats.totals.totalCharsSaved / 1024).toFixed(1)}KB (~${globalStats.totals.totalTokensSaved} tokens across ${globalStats.totals.totalRounds} turns)`);
+				}
 				lines.push(
 					`• Skill Capsules in Cache: ${skillCapsulesCount}`,
 					`• Tool Guideline Capsules in Cache: ${toolCapsulesCount}`,
@@ -580,7 +623,10 @@ export default function promptDiet(pi: ExtensionAPI) {
 				}
 				return output;
 			},
-		});
+		};
+		(pi as any).registerCommand("pi-prompt-diet", commandDef);
+		(pi as any).registerCommand("prompt-diet", commandDef);
+		(pi as any).registerCommand("diet", commandDef);
 	}
 
 	pi.on("session_start", (_event, _ctx) => {
@@ -589,8 +635,10 @@ export default function promptDiet(pi: ExtensionAPI) {
 		knownSkills.clear();
 		pendingDistillation.clear();
 		pendingToolDistillation.clear();
-		const sessionKey = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
-		sessionStatsMap.delete(sessionKey);
+		const sessionKey = getSessionKey(_ctx);
+		if (_event.reason === "new") {
+			sessionStatsMap.delete(sessionKey);
+		}
 	});
 
 	pi.on("context", async (event, _ctx) => {
@@ -624,7 +672,16 @@ export default function promptDiet(pi: ExtensionAPI) {
 								const head = lines.slice(0, 6).join("\n");
 								const tail = lines.slice(-2).join("\n");
 								const omittedLines = lines.length - 8;
-								const notice = `\n\n... [pi-prompt-diet: ${omittedLines} lines (~${originalLength - head.length - tail.length} chars) of historical ${m.toolName || "tool"} output scrubbed to preserve context] ...\n\n`;
+								const notice = `\n\n... [pi-prompt-diet: ${omittedLines} lines (~${originalLength - head.length - tail.length} chars) of historical ${m.toolName || "tool"} output scrubbed to preserve context; call ${m.toolName || "tool"} to re-inspect if needed] ...\n\n`;
+								const scrubbedText = head + notice + tail;
+								scrubbedCount++;
+								savedChars += (originalLength - scrubbedText.length);
+								messageModified = true;
+								return { ...c, text: scrubbedText };
+							} else {
+								const head = c.text.slice(0, 600);
+								const tail = c.text.slice(-200);
+								const notice = `\n\n... [pi-prompt-diet: ~${originalLength - head.length - tail.length} chars of historical ${m.toolName || "tool"} output scrubbed to preserve context; call ${m.toolName || "tool"} to re-inspect if needed] ...\n\n`;
 								const scrubbedText = head + notice + tail;
 								scrubbedCount++;
 								savedChars += (originalLength - scrubbedText.length);
@@ -635,15 +692,46 @@ export default function promptDiet(pi: ExtensionAPI) {
 						return c;
 					});
 					return messageModified ? { ...m, content: newContent } : m;
+				} else if (typeof m.content === "string" && m.content.length > maxChars) {
+					const originalLength = m.content.length;
+					const lines = m.content.split("\n");
+					if (lines.length > 8) {
+						const head = lines.slice(0, 6).join("\n");
+						const tail = lines.slice(-2).join("\n");
+						const omittedLines = lines.length - 8;
+						const notice = `\n\n... [pi-prompt-diet: ${omittedLines} lines (~${originalLength - head.length - tail.length} chars) of historical ${m.toolName || "tool"} output scrubbed to preserve context; call ${m.toolName || "tool"} to re-inspect if needed] ...\n\n`;
+						const scrubbedText = head + notice + tail;
+						scrubbedCount++;
+						savedChars += (originalLength - scrubbedText.length);
+						return { ...m, content: scrubbedText };
+					} else {
+						const head = m.content.slice(0, 600);
+						const tail = m.content.slice(-200);
+						const notice = `\n\n... [pi-prompt-diet: ~${originalLength - head.length - tail.length} chars of historical ${m.toolName || "tool"} output scrubbed to preserve context; call ${m.toolName || "tool"} to re-inspect if needed] ...\n\n`;
+						const scrubbedText = head + notice + tail;
+						scrubbedCount++;
+						savedChars += (originalLength - scrubbedText.length);
+						return { ...m, content: scrubbedText };
+					}
 				}
 				return m;
 			});
 
 			if (scrubbedCount > 0) {
-				const sessionName = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
+				const sessionName = getSessionKey(_ctx);
 				const stats = getOrCreateSessionStats(sessionName);
 				stats.scrubbedToolResultsCount += scrubbedCount;
 				stats.scrubbedSavedChars += savedChars;
+
+				recordStatsDelta({
+					scrubbedToolResultsCount: scrubbedCount,
+					scrubbedSavedChars: savedChars,
+				});
+
+				saveSessionState(sessionName, {
+					scrubbedToolResultsCount: stats.scrubbedToolResultsCount,
+					scrubbedSavedChars: stats.scrubbedSavedChars,
+				});
 
 				if (config.showNotices !== false) {
 					const estTokens = Math.round(savedChars / 4);
@@ -660,7 +748,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 		}
 
 		// ── 2. Preflight 语义意图注入 (<system_directive>) ─────────────────
-		const sessionName = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
+		const sessionName = getSessionKey(_ctx);
 		const hint = turnRoutingHints.get(sessionName);
 		if (!hint) return { messages: currentMessages };
 
@@ -794,7 +882,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 		const rawDocsBlock = docsMatch ? docsMatch[0] : "";
 
 		// ── 3. Soft Routing Preflight (Semantic Intent Router) ───────────
-		const sessionName = _ctx.sessionManager?.getSessionName?.() || _ctx.cwd || "default";
+		const sessionName = getSessionKey(_ctx);
 		turnRoutingHints.delete(sessionName); // clear previous turn's hint
 		
 		let routedTools: string[] = [];
@@ -803,14 +891,19 @@ export default function promptDiet(pi: ExtensionAPI) {
 		let preflightSucceeded = false;
 
 		// Skip pure continuations heuristically to save preflight costs
-		const isContinuation = /^(continue|go on|ok|go|ok go|proceed|yes|y|继续|继续做|继续吧|好的|可以|收到|再试一次)$/i.test(event.prompt.trim().replace(/[。.!！]$/, ""));
+		const isContinuation = /^(continue|go on|ok|go|ok go|go ahead|proceed|next|next step|yes|y|继续|继续做|继续吧|好的|可以|收到|下一步|推进下一步|继续下一步|再试一次|继续执行|继续优化|继续排查|继续推进|好的继续|可以继续)(\s*(做|看|排查|优化|执行|推进|吧|一下|测试|验证))?$/i.test(event.prompt.trim().replace(/[。.!！,， ]+$/, ""));
 		if (isContinuation) {
 			preflightSucceeded = true;
-			routedTools = typeof (pi as any).getActiveTools === "function"
-				? (pi as any).getActiveTools().filter((t: string) => t !== REQUEST_CAPABILITIES_TOOL && t !== CALL_TOOL)
-				: allTools.map((t) => t.name);
-			routedSkills = rawSkills.map((s) => s.name);
-			needDocs = true;
+			const lastStats = sessionStatsMap.get(sessionName) || loadSessionState(sessionName);
+			if (lastStats?.activeTools && lastStats.activeTools.length > 0) {
+				routedTools = lastStats.activeTools.filter((t: string) => t !== REQUEST_CAPABILITIES_TOOL && t !== CALL_TOOL);
+			} else if (typeof (pi as any).getActiveTools === "function") {
+				routedTools = (pi as any).getActiveTools().filter((t: string) => t !== REQUEST_CAPABILITIES_TOOL && t !== CALL_TOOL);
+			} else {
+				routedTools = allTools.map((t) => t.name);
+			}
+			routedSkills = lastStats?.activeSkills ?? [];
+			needDocs = lastStats?.needDocs ?? false;
 		} else if (config.adaptive?.softRouting !== false && event.prompt.trim() !== "") {
 			try {
 				const preflightModelStr = config.adaptive?.preflightModel || "CPA/gemini-3.5-flash-lite";
@@ -835,8 +928,12 @@ export default function promptDiet(pi: ExtensionAPI) {
 				
 				if (preflightModel && _ctx.modelRegistry.hasConfiguredAuth(preflightModel)) {
 					const catalog = {
-						tools: allTools.map((t) => ({ name: t.name, description: compactCatalogDescription(t.description, 200) })),
-						skills: rawSkills.map((s) => ({ name: s.name, description: compactCatalogDescription(s.description, 200) })),
+						tools: allTools
+							.map((t) => ({ name: t.name, description: compactCatalogDescription(t.description, 200) }))
+							.sort((a, b) => a.name.localeCompare(b.name)),
+						skills: rawSkills
+							.map((s) => ({ name: s.name, description: compactCatalogDescription(s.description, 200) }))
+							.sort((a, b) => a.name.localeCompare(b.name)),
 					};
 					const systemAnalysisPrompt = `You are a pre-flight intent analyzer for an AI coding agent.
 Read the user's request and identify EXACTLY which tools, skills, and documentation are needed to solve it efficiently.
@@ -865,7 +962,9 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 					let memoryContext = "";
 					const memMatch = event.systemPrompt.match(/## Nowledge Mem Context Bundle[\s\S]*?(?=\n<|$)/i);
 					if (memMatch) {
-						memoryContext = `\n\n【PERSISTENT MEMORY CONTEXT】:\n${memMatch[0].trim()}`;
+						const trimmedMem = memMatch[0].trim();
+						const compactMem = trimmedMem.length > 1500 ? truncateHeadTail(trimmedMem, 1500, 0.4) : trimmedMem;
+						memoryContext = `\n\n【PERSISTENT MEMORY CONTEXT】:\n${compactMem}`;
 					}
 
 					let recentHistory = "";
@@ -1096,6 +1195,22 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 		const stats = getOrCreateSessionStats(sessionName);
 		stats.promptInitialChars = initialPromptLength;
 		stats.promptSlimmedChars = finalLength;
+		stats.activeTools = activeToolNames;
+		stats.activeSkills = [...neededSkills];
+		stats.needDocs = needDocs;
+
+		recordStatsDelta({
+			promptInitialChars: initialPromptLength,
+			promptSlimmedChars: finalLength,
+		});
+
+		saveSessionState(sessionName, {
+			promptInitialChars: initialPromptLength,
+			promptSlimmedChars: finalLength,
+			activeTools: activeToolNames,
+			activeSkills: [...neededSkills],
+			needDocs,
+		});
 
 		if (config.showNotices !== false) {
 			const activeCount = activeToolNames.length;

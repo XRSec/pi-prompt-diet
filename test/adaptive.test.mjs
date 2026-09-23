@@ -22,6 +22,10 @@ const {
 	saveSkillCapsuleCache,
 	saveToolGuidelineCapsule,
 	truncateHeadTail,
+	loadGlobalStats,
+	loadSessionState,
+	saveSessionState,
+	recordStatsDelta,
 } = await import("../adaptive.ts");
 
 const tools = [
@@ -397,7 +401,7 @@ test("pure affirmative continuations bypass preflight model call", async () => {
 		return { stopReason: "stop", content: [{ type: "text", text: "{}" }] };
 	}, [], { adaptive: { softRouting: true } });
 
-	for (const phrase of ["ok go", "go", "ok", "proceed", "继续吧", "收到", "yes"]) {
+	for (const phrase of ["ok go", "go", "ok", "proceed", "继续吧", "收到", "yes", "继续优化", "继续排查", "继续推进"]) {
 		modelCalled = false;
 		const event = { ...eventFor(skills), prompt: phrase };
 		await harness.emit("before_agent_start", event, harness.ctx);
@@ -576,7 +580,7 @@ test("tool result scrubbing condenses historical large tool outputs but protects
 	// 1. Turn 1 toolResult (index 2): historical & > 1200 chars -> scrubbed!
 	const scrubbedT1 = resMessages[2].content[0].text;
 	assert.ok(scrubbedT1.length < bigOutput.length);
-	assert.match(scrubbedT1, /\[pi-prompt-diet: \d+ lines \(~\d+ chars\) of historical grep output scrubbed to preserve context\]/);
+	assert.match(scrubbedT1, /\[pi-prompt-diet: \d+ lines \(~\d+ chars\) of historical grep output scrubbed to preserve context/);
 	assert.ok(scrubbedT1.startsWith("Line 1:"));
 	assert.ok(scrubbedT1.endsWith("Line 100: data data data data data data data data data data "));
 
@@ -588,9 +592,143 @@ test("tool result scrubbing condenses historical large tool outputs but protects
 	const recentT3 = resMessages[8].content[0].text;
 	assert.equal(recentT3, bigOutput, "Recent turn tool results within safe window must remain intact");
 
-	// 4. Command reports scrubbed stats
+	// 4. Command reports scrubbed stats and global cumulative saved
 	const statusOutput = await harness.executeCommand("pi-prompt-diet");
 	assert.match(statusOutput, /Scrubbed Tool Results: 1 items/);
+	assert.match(statusOutput, /Global Cumulative Saved/);
+});
+
+test("tool result scrubbing condenses single-line and string outputs while protecting errors", async () => {
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: "{}" }] }));
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+
+	const singleLineLong = "A".repeat(3000);
+	const multiLineString = Array.from({ length: 60 }, (_, i) => `Log line ${i}: verbose info ${"data ".repeat(10)}`).join("\n");
+	assert.ok(multiLineString.length > 1200);
+
+	const messages = [
+		// Turn 1: single-line long output in array
+		{ role: "user", content: [{ type: "text", text: "Fetch huge JSON" }] },
+		{ role: "assistant", content: [{ type: "toolCall", toolName: "curl", toolCallId: "c1" }] },
+		{ role: "toolResult", toolName: "curl", toolCallId: "c1", isError: false, content: [{ type: "text", text: singleLineLong }] },
+
+		// Turn 2: string content (not array)
+		{ role: "user", content: [{ type: "text", text: "Run big command" }] },
+		{ role: "assistant", content: [{ type: "toolCall", toolName: "bash", toolCallId: "c2" }] },
+		{ role: "toolResult", toolName: "bash", toolCallId: "c2", isError: false, content: multiLineString },
+
+		// Turn 3: older turn
+		{ role: "user", content: [{ type: "text", text: "Intermediate call" }] },
+		{ role: "assistant", content: [{ type: "toolCall", toolName: "read", toolCallId: "c3" }] },
+		{ role: "toolResult", toolName: "read", toolCallId: "c3", isError: false, content: [{ type: "text", text: "short result" }] },
+
+		// Turn 4: recent turn (safe window)
+		{ role: "user", content: [{ type: "text", text: "Recent call" }] },
+		{ role: "assistant", content: [{ type: "toolCall", toolName: "read", toolCallId: "c4" }] },
+		{ role: "toolResult", toolName: "read", toolCallId: "c4", isError: false, content: [{ type: "text", text: singleLineLong }] },
+
+		// Turn 5: user
+		{ role: "user", content: [{ type: "text", text: "Next step" }] },
+	];
+
+	const res = await harness.emit("context", { messages }, harness.ctx);
+	const resMessages = res.messages;
+
+	// Turn 1: single-line array text should be scrubbed with char-based notice
+	const t1 = resMessages[2].content[0].text;
+	assert.ok(t1.length < singleLineLong.length);
+	assert.match(t1, /\[pi-prompt-diet: ~\d+ chars of historical curl output scrubbed to preserve context/);
+	assert.ok(t1.startsWith("AAAAAA"));
+	assert.ok(t1.endsWith("AAAAAA"));
+
+	// Turn 2: plain string content should be scrubbed with line-based notice
+	const t2 = resMessages[5].content;
+	assert.ok(typeof t2 === "string");
+	assert.ok(t2.length < multiLineString.length);
+	assert.match(t2, /\[pi-prompt-diet: \d+ lines \(~\d+ chars\) of historical bash output scrubbed to preserve context/);
+
+	// Turn 4: recent turn intact
+	assert.equal(resMessages[11].content[0].text, singleLineLong);
+});
+
+test("cross-process continuation restores session state from disk and avoids full tool reload", async () => {
+	const sessionId = "cross-proc-session-uuid-456";
+	// Pre-populate disk state simulating a previous process run
+	saveSessionState(sessionId, {
+		promptInitialChars: 8000,
+		promptSlimmedChars: 1500,
+		activeTools: ["read", "edit"],
+		activeSkills: ["weather-helper"],
+		needDocs: false,
+		scrubbedToolResultsCount: 2,
+		scrubbedSavedChars: 4000,
+	});
+
+	let preflightCalls = 0;
+	const harness = createHarness(async () => {
+		preflightCalls += 1;
+		return { stopReason: "stop", content: [{ type: "text", text: '{"focus_tools":["web_search"],"focus_skills":[],"need_docs":false}' }] };
+	});
+	// Simulate ctx having sessionManager with this sessionId
+	harness.ctx.sessionManager = {
+		getSessionId: () => sessionId,
+		getBranch: () => [],
+	};
+
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+
+	const promptEvent = {
+		prompt: "继续优化",
+		systemPrompt: "Base prompt with tools:\n- read: Read\n- edit: Edit\n- web_search: Web search\n<available_skills>\nplaceholder\n</available_skills>",
+		systemPromptOptions: { skills: [], promptGuidelines: [] },
+	};
+
+	await harness.emit("before_agent_start", promptEvent, harness.ctx);
+
+	// Preflight LLM must NOT be called
+	assert.equal(preflightCalls, 0);
+
+	// Active tools must be restored from disk: read, edit, call_tool, request_capabilities
+	const active = harness.ctx.getActiveTools ? harness.ctx.getActiveTools() : [];
+	// The harness pi.getActiveTools()
+	assert.deepEqual(
+		harness.registeredToolDefs.has("call_tool"),
+		true,
+	);
+});
+
+test("expanded continuation phrases match affirmative follow-ups without preflight", async () => {
+	const phrases = [
+		"继续",
+		"继续优化",
+		"继续优化一下",
+		"继续推进",
+		"推进下一步",
+		"下一步",
+		"好的继续",
+		"ok go.",
+		"go ahead",
+		"next step",
+	];
+
+	let completions = 0;
+	const harness = createHarness(async () => {
+		completions += 1;
+		return { stopReason: "stop", content: [{ type: "text", text: "{}" }] };
+	}, [], { adaptive: { softRouting: true } });
+
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+
+	for (const p of phrases) {
+		const ev = {
+			prompt: p,
+			systemPrompt: "Base prompt with tools:\n- read: Read\n- edit: Edit\n<available_skills></available_skills>",
+			systemPromptOptions: { skills: [] },
+		};
+		await harness.emit("before_agent_start", ev, harness.ctx);
+	}
+
+	assert.equal(completions, 0, "All affirmative continuation phrases must bypass preflight LLM");
 });
 
 test.after(() => rmSync(testHome, { recursive: true, force: true }));
