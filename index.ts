@@ -625,8 +625,6 @@ function maskSessionId(id: string): string {
 			},
 		};
 		(pi as any).registerCommand("pi-prompt-diet", commandDef);
-		(pi as any).registerCommand("prompt-diet", commandDef);
-		(pi as any).registerCommand("diet", commandDef);
 	}
 
 	pi.on("session_start", (_event, _ctx) => {
