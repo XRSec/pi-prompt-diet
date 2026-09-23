@@ -731,17 +731,16 @@ function maskSessionId(id: string): string {
 					scrubbedSavedChars: stats.scrubbedSavedChars,
 				});
 
-				if (config.showNotices !== false) {
-					const estTokens = Math.round(savedChars / 4);
-					const scrubMsg = `🧹 [pi-prompt-diet] 历史工具清洗: 压缩 ${scrubbedCount} 个旧工具结果，净省 ${(savedChars / 1024).toFixed(1)}KB (~${estTokens} tokens)`;
-					notifyDiet(_ctx, scrubMsg, "info");
-
-					const promptPercent = stats.promptInitialChars > 0
-						? Math.round(((stats.promptInitialChars - stats.promptSlimmedChars) / stats.promptInitialChars) * 100)
-						: 0;
-					const totalScrubbedKb = (stats.scrubbedSavedChars / 1024).toFixed(0);
-					updateDietStatus(_ctx, `🌿 Diet: -${promptPercent}% | 🧹 累计省 ${totalScrubbedKb}KB`);
-				}
+				const promptPercent = stats.promptInitialChars > 0
+					? Math.round(((stats.promptInitialChars - stats.promptSlimmedChars) / stats.promptInitialChars) * 100)
+					: 0;
+				const totalScrubbedKb = (stats.scrubbedSavedChars / 1024).toFixed(0);
+				const statusText = promptPercent > 0
+					? `🌿 Diet: -${promptPercent}% | 🧹 累计省 ${totalScrubbedKb}KB`
+					: (stats.promptSlimmedChars > 0
+						? `🌿 Diet: ${(stats.promptSlimmedChars / 1024).toFixed(1)}KB | 🧹 累计省 ${totalScrubbedKb}KB`
+						: `🌿 Diet | 🧹 累计省 ${totalScrubbedKb}KB`);
+				updateDietStatus(_ctx, statusText);
 			}
 		}
 
