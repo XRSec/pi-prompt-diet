@@ -252,6 +252,7 @@ const DEFAULT_CORE_GUIDELINES = [
 	"  • delegate (general-purpose autonomous delegation)",
 	"- Interactive Clarification: When requirements or designs are ambiguous, call ask_user_question to render structured options rather than guessing.",
 	"- Inactive Tools: Any tool listed under Inactive tools can be called directly in a single turn via call_tool(tool, parameters) without prior activation.",
+	"- Existing Script Black-Box Execution: For established CLI/automation scripts (e.g. in ego-script/, scripts/), read ONLY the header/usage comment (top 20-30 lines) or run --help. NEVER read entire implementation files or probe internal mechanics when CLI usage is documented. Execute directly.",
 	"- Be concise in your responses and show file paths clearly.",
 ];
 
