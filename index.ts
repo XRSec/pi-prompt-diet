@@ -156,9 +156,10 @@ function notifyDiet(
 	}
 }
 
-function updateDietStatus(ctx: ExtensionContext, text: string | undefined) {
+function updateDietStatus(ctx: ExtensionContext, _text: string | undefined) {
+	// Bottom-left status disabled per user preference
 	if ((ctx as any)?.hasUI && typeof (ctx as any).ui?.setStatus === "function") {
-		(ctx as any).ui.setStatus("prompt-diet", text);
+		(ctx as any).ui.setStatus("prompt-diet", undefined);
 	}
 }
 
