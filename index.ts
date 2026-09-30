@@ -47,6 +47,20 @@ export interface PackageOverrideConfig {
 	maxDescriptionLength?: number;
 }
 
+export interface TaskContract {
+	intent: "analytical" | "execution" | "composite";
+	allow_write: boolean;
+	reason?: string;
+	clarified_intent?: string;
+	typo_corrections?: string[];
+	protected_terms?: string[];
+	focus_tools?: string[];
+	focus_skills?: string[];
+	need_docs?: boolean;
+	source: "preflight" | "continuation" | "fallback";
+	updatedAt: number;
+}
+
 export interface ToolResultScrubbingConfig {
 	enabled?: boolean;
 	maxChars?: number;
@@ -73,6 +87,32 @@ export interface PromptDietConfig {
 const turnRoutingHints = new Map<string, string>();
 const CALL_TOOL = "call_tool";
 const REQUEST_CAPABILITIES_TOOL = "request_capabilities";
+
+function emitDietStepMessage(
+	pi: ExtensionAPI,
+	ctx: any,
+	customType: string,
+	content: string,
+	details?: unknown
+) {
+	const msg = {
+		customType,
+		content,
+		display: true,
+		details,
+	};
+	try {
+		if (typeof (pi as any).sendMessage === "function") {
+			(pi as any).sendMessage(msg, { triggerTurn: false });
+		} else if (typeof (ctx as any)?.sendMessage === "function") {
+			(ctx as any).sendMessage(msg, { triggerTurn: false });
+		} else if (ctx?.sessionManager?.appendCustomMessageEntry) {
+			ctx.sessionManager.appendCustomMessageEntry(msg.customType, msg.content, msg.display, msg.details);
+		}
+	} catch (e) {
+		console.error("[pi-prompt-diet] emitDietStepMessage error:", e);
+	}
+}
 
 interface SessionStats {
 	promptInitialChars: number;
@@ -113,7 +153,9 @@ function notifyDiet(
 	message: string,
 	level: "info" | "warning" | "error" = "info"
 ) {
-	if ((ctx as any)?.hasUI && (ctx as any).ui?.notify) {
+	// Routine info is displayed via setStatus / setWidget on pi-web and TUI.
+	// Only popup notifications for warnings or errors to keep pi-web clean.
+	if (level !== "info" && (ctx as any)?.hasUI && (ctx as any).ui?.notify) {
 		(ctx as any).ui.notify(message, level);
 	}
 	if (!(ctx as any)?.hasUI || process.env.DEBUG) {
@@ -123,18 +165,26 @@ function notifyDiet(
 
 function updateDietStatus(ctx: ExtensionContext, text: string | undefined) {
 	if ((ctx as any)?.hasUI && typeof (ctx as any).ui?.setStatus === "function") {
-		(ctx as any).ui.setStatus("pi-prompt-diet", text);
+		(ctx as any).ui.setStatus("prompt-diet", text);
 	}
 }
 
-// Lean primitive baseline: read, write, bash, edit.
-// Advanced capabilities (replace/hashline, find/grep, bg_run, subagent)
+function updateDietWidget(ctx: ExtensionContext, lines: string[] | undefined) {
+	if ((ctx as any)?.hasUI && typeof (ctx as any).ui?.setWidget === "function") {
+		(ctx as any).ui.setWidget("prompt-diet", lines);
+	}
+}
+
+// Lean primitive baseline: read, write, bash, edit, find, grep.
+// Advanced capabilities (replace/hashline, bg_run, subagent)
 // are dynamically activated on-demand via semantic preflight routing or call_tool.
 const DEFAULT_REQUIRED_TOOLS = [
 	"read",
 	"write",
 	"bash",
 	"edit",
+	"find",
+	"grep",
 ];
 
 function unique(values: Iterable<string>): string[] {
@@ -479,11 +529,34 @@ export default function promptDiet(pi: ExtensionAPI) {
 						const config = loadConfig(ctx.cwd);
 						if (config.showNotices !== false) {
 							notifyDiet(ctx, `⚡ [pi-prompt-diet] 即时调用非活跃工具: ${params.tool}`, "info");
+							updateDietStatus(ctx, `🌿 Diet: 即时激活 ${params.tool} (活跃 ${newActive.length})`);
+							updateDietWidget(ctx, [
+								`🌿 Prompt Diet: 工具即时激活`,
+								`├─ 调用工具: ${params.tool} (call_tool 单轮直通)`,
+								`├─ 活跃工具数: ${newActive.length}`,
+								`└─ 状态: 已动态加载执行`,
+							]);
 						}
-					} catch {}
+					} catch (e: any) {
+						if (process.env.DEBUG) {
+							console.error("[CallTool] Error activating tool:", e);
+						}
+					}
 				}
 				try {
-					return await target.execute(toolCallId, params.parameters ?? {}, signal, onUpdate, ctx);
+					if (typeof (target as any).execute === "function") {
+						return await (target as any).execute(toolCallId, params.parameters ?? {}, signal, onUpdate, ctx);
+					}
+					// If target is metadata-only (standard Pi getAllTools behavior), activate the tool and notify the agent
+					return {
+						content: [
+							{
+								type: "text",
+								text: `⚡ [pi-prompt-diet] Tool "${params.tool}" has been successfully activated into your active tool set. You can now execute "${params.tool}" directly.`,
+							},
+						],
+						isError: false,
+					};
 				} catch (err: any) {
 					return {
 						content: [{ type: "text", text: `Error calling tool "${params.tool}": ${err?.message || String(err)}` }],
@@ -537,6 +610,15 @@ export default function promptDiet(pi: ExtensionAPI) {
 						if (addedTools.length > 0) caps.push(`工具 [${addedTools.join(", ")}]`);
 						if (requestedSkills.length > 0) caps.push(`技能 [${requestedSkills.join(", ")}]`);
 						notifyDiet(_ctx, `⚡ [pi-prompt-diet] 按需激活: ${caps.join("，")}`, "info");
+						const desc = addedTools.length > 0 ? `工具: ${addedTools.join(", ")}` : `技能: ${requestedSkills.join(", ")}`;
+						updateDietStatus(_ctx, `🌿 Diet: 按需激活 ${desc}`);
+						updateDietWidget(_ctx, [
+							`🌿 Prompt Diet: 能力按需激活`,
+							...(addedTools.length > 0 ? [`├─ 新增工具: ${addedTools.join(", ")}`] : []),
+							...(requestedSkills.length > 0 ? [`├─ 新增技能: ${requestedSkills.join(", ")}`] : []),
+							`├─ 原因说明: ${params.reason || "无"}`,
+							`└─ 状态: 完整文档已按需注入`,
+						]);
 					}
 				}
 
@@ -637,6 +719,13 @@ function maskSessionId(id: string): string {
 		if (_event.reason === "new") {
 			sessionStatsMap.delete(sessionKey);
 		}
+		updateDietStatus(_ctx, "🌿 Diet: 监听中 (基线)");
+		updateDietWidget(_ctx, [
+			"🌿 Prompt Diet (提示词与上下文精简)",
+			"├─ 基线工具: read, write, bash, edit (按需激活高级工具)",
+			"├─ 提示词瘦身: 动态精简系统指引与技能规则",
+			"└─ 状态: 会话已就绪"
+		]);
 	});
 
 	pi.on("context", async (event, _ctx) => {
@@ -646,18 +735,40 @@ function maskSessionId(id: string): string {
 
 		let currentMessages = event.messages;
 
-		// ── 1. Tool Result Scrubbing (历史工具超大输出滑动衰减) ───────────────
+		// ── 0. Step Card Context Isolation (确保所有自定义步骤卡片不渗入大模型上下文，0 Token 泄漏) ──
+		if (Array.isArray(currentMessages)) {
+			currentMessages = currentMessages.filter((m: any) => {
+				if (m.role === "custom") return false;
+				if (typeof m.customType === "string" && (
+					m.customType.startsWith("prompt-diet:") ||
+					m.customType.startsWith("distill:") ||
+					m.customType.startsWith("supervisor:")
+				)) return false;
+				return true;
+			});
+		}
+
+		// ── 1. Tool Result Scrubbing (历史工具超大输出阶梯分块衰减，保护 KV Cache) ─────────
 		const scrubConfig = config.toolResultScrubbing ?? {};
 		if (scrubConfig.enabled !== false && Array.isArray(currentMessages)) {
 			const keepTurns = scrubConfig.keepRecentTurns ?? 2;
 			const safeWindowCount = Math.max(4, keepTurns * 2 + 2);
 			const maxChars = scrubConfig.maxChars ?? 1200;
 
+			// 阶梯式稳定边界（Chunk-aligned Step Boundary）：
+			// 普通滑动窗口会在每一步都往前移动 1~2 条，导致历史前缀逐轮变动、KV Cache 全量穿透。
+			// 采用阶梯步长 (stepBlock = 6)，使得连续多个回合内边界保持绝对静止，保护大模型 Prompt Cache 前缀。
+			const unfreezedCount = currentMessages.length - safeWindowCount;
+			const stepBlock = 6;
+			const scrubBoundary = unfreezedCount <= 0
+				? 0
+				: (unfreezedCount <= stepBlock ? unfreezedCount : Math.floor(unfreezedCount / stepBlock) * stepBlock);
+
 			let scrubbedCount = 0;
 			let savedChars = 0;
 
 			currentMessages = currentMessages.map((m: any, idx: number) => {
-				if (idx >= currentMessages.length - safeWindowCount) return m;
+				if (idx >= scrubBoundary) return m;
 				if (m.role !== "toolResult" || m.isError) return m;
 
 				if (Array.isArray(m.content)) {
@@ -741,6 +852,17 @@ function maskSessionId(id: string): string {
 						? `🌿 Diet: ${(stats.promptSlimmedChars / 1024).toFixed(1)}KB | 🧹 累计省 ${totalScrubbedKb}KB`
 						: `🌿 Diet | 🧹 累计省 ${totalScrubbedKb}KB`);
 				updateDietStatus(_ctx, statusText);
+
+				const widgetLines = [
+					`🌿 Prompt Diet: 历史工具超大输出阶梯衰减`,
+					`├─ 本轮削减: ${scrubbedCount} 条超大输出 (衰减 ${(savedChars / 1024).toFixed(1)}KB)`,
+					`├─ 累计瘦身: ${totalScrubbedKb}KB (${stats.scrubbedToolResultsCount} 条历史记录已裁剪)`,
+				];
+				if (stats.promptSlimmedChars > 0) {
+					widgetLines.push(`├─ 提示词基线: ${(stats.promptSlimmedChars / 1024).toFixed(1)}KB (-${promptPercent}%)`);
+				}
+				widgetLines.push(`└─ 状态: 阶梯式静止边界对齐，KV Cache 保护已生效`);
+				updateDietWidget(_ctx, widgetLines);
 			}
 		}
 
@@ -805,8 +927,27 @@ function maskSessionId(id: string): string {
 					if (capsule) {
 						skillCache.skills[skill.filePath] = capsule;
 						saveSkillCapsule(skillCache, skill.filePath, capsule.fingerprint);
+						emitDietStepMessage(pi, ctx, "prompt-diet:capsule", [
+							`### 🌿 技能胶囊已沉淀 (\`${skill.name}\`)`,
+							`- **核心规则**: ${capsule.essentialRules.length} 条约束`,
+							`- **激活意图**: ${capsule.trigger}`,
+							`- **完整加载条件**: ${capsule.readFullWhen}`,
+						].join("\n"), {
+							skill: skill.name,
+							essentialRules: capsule.essentialRules,
+							trigger: capsule.trigger,
+							readFullWhen: capsule.readFullWhen,
+							timestamp: new Date().toISOString(),
+						});
 						if (config.showNotices !== false) {
 							notifyDiet(ctx, `✨ [pi-prompt-diet] 技能胶囊已蒸馏沉淀: ${skill.name} (${capsule.essentialRules.length} 条核心约束)`, "info");
+							updateDietStatus(ctx, `🌿 Diet: 技能胶囊已沉淀 (${skill.name})`);
+							updateDietWidget(ctx, [
+								`🌿 Prompt Diet: 技能胶囊沉淀`,
+								`├─ 技能名称: ${skill.name}`,
+								`├─ 核心规则: ${capsule.essentialRules.length} 条`,
+								`└─ 状态: 胶囊已持久化`,
+							]);
 						}
 					}
 				} catch (error) {
@@ -828,9 +969,26 @@ function maskSessionId(id: string): string {
 					const key = `${capsule.source}:${capsule.name}`;
 					toolGuidelineCache.tools[key] = capsule;
 					saveToolGuidelineCapsule(toolGuidelineCache, key, tool);
+					const count = capsule.mode === "capsule" ? `${capsule.essentialRules.length} 条准则` : "保留完整";
+					emitDietStepMessage(pi, ctx, "prompt-diet:capsule", [
+						`### 🌿 工具准则胶囊已沉淀 (\`${tool.name}\`)`,
+						`- **沉淀模式**: \`${capsule.mode}\``,
+						`- **核心约束**: ${count}`,
+					].join("\n"), {
+						tool: tool.name,
+						mode: capsule.mode,
+						essentialRules: capsule.mode === "capsule" ? capsule.essentialRules : [],
+						timestamp: new Date().toISOString(),
+					});
 					if (config.showNotices !== false) {
-						const count = capsule.mode === "capsule" ? `${capsule.essentialRules.length} 条准则` : "保留完整";
 						notifyDiet(ctx, `✨ [pi-prompt-diet] 工具准则已蒸馏沉淀: ${tool.name} (${count})`, "info");
+						updateDietStatus(ctx, `🌿 Diet: 工具准则已沉淀 (${tool.name})`);
+						updateDietWidget(ctx, [
+							`🌿 Prompt Diet: 工具准则胶囊沉淀`,
+							`├─ 工具名称: ${tool.name}`,
+							`├─ 模式: ${count}`,
+							`└─ 状态: 胶囊已持久化`,
+						]);
 					}
 				} catch (error) {
 					console.warn(`[pi-prompt-diet] Failed to distill guidelines for ${tool.name}:`, error);
@@ -901,6 +1059,34 @@ function maskSessionId(id: string): string {
 			}
 			routedSkills = lastStats?.activeSkills ?? [];
 			needDocs = lastStats?.needDocs ?? false;
+
+			const globalContracts = ((globalThis as any).__PI_TASK_CONTRACTS__ =
+				(globalThis as any).__PI_TASK_CONTRACTS__ || new Map<string, TaskContract>());
+			const existingContract = globalContracts.get(sessionName);
+			if (existingContract) {
+				globalContracts.set(sessionName, {
+					...existingContract,
+					source: "continuation",
+					updatedAt: Date.now(),
+				});
+			}
+
+			const contCardLines = [
+				`### ⏩ 任务顺延 (Continuation)`,
+				`- **判定**: 检测到顺延推进指令，已复用既定意图与能力路由（跳过重复预检，节省 Token）`,
+				`- **承接意图**: \`${existingContract ? existingContract.intent.toUpperCase() : "EXECUTION"}\` (${existingContract?.allow_write !== false ? "允许代码修改" : "纯分析/只读"})`,
+				`- **活跃工具**: ${routedTools.length > 0 ? routedTools.map((t) => `\`${t}\``).join(", ") : "无"}`,
+				`- **活跃技能**: ${routedSkills.length > 0 ? routedSkills.map((s) => `\`${s}\``).join(", ") : "无"}`,
+			];
+			emitDietStepMessage(pi, _ctx, "prompt-diet:continuation", contCardLines.join("\n"), {
+				isContinuation: true,
+				prompt: event.prompt,
+				routedTools,
+				routedSkills,
+				needDocs,
+				contract: existingContract,
+				timestamp: new Date().toISOString(),
+			});
 		} else if (config.adaptive?.softRouting !== false && event.prompt.trim() !== "") {
 			try {
 				const preflightModelStr = config.adaptive?.preflightModel || "CPA/gemini-3.5-flash-lite";
@@ -917,7 +1103,11 @@ function maskSessionId(id: string): string {
 								preflightModel = all.find(
 									(m: any) => m && m.provider && m.provider.toLowerCase() === prov.toLowerCase() && m.id === mId
 								);
-							} catch {}
+							} catch (e: any) {
+								if (process.env.DEBUG) {
+									console.error("[Preflight] Error finding model:", e);
+								}
+							}
 						}
 						preflightModel = preflightModel || _ctx.model;
 					}
@@ -932,14 +1122,38 @@ function maskSessionId(id: string): string {
 							.map((s) => ({ name: s.name, description: compactCatalogDescription(s.description, 200) }))
 							.sort((a, b) => a.name.localeCompare(b.name)),
 					};
-					const systemAnalysisPrompt = `You are a pre-flight intent analyzer for an AI coding agent.
-Read the user's request and identify EXACTLY which tools, skills, and documentation are needed to solve it efficiently.
-The agent already has access to all tools, but we want to guide its attention to the most relevant ones to avoid distraction and hallucinations.
-Respond ONLY with a JSON object: { "focus_skills": string[], "focus_tools": string[], "need_docs": boolean }.
-Only include names that exist in the catalog. If unsure, prefer a minimal set.
+					const systemAnalysisPrompt = `You are an elite pre-flight intent analyzer and task contract architect for an AI coding agent.
+Analyze the user's latest request and context, then return ONLY a JSON object with this exact shape:
+{
+  "intent": "analytical" | "execution" | "composite",
+  "allow_write": boolean,
+  "reason": string,
+  "clarified_intent": string,
+  "typo_corrections": string[],
+  "protected_terms": string[],
+  "focus_skills": string[],
+  "focus_tools": string[],
+  "need_docs": boolean
+}
 
-SPECIAL MEMORY RULE:
-If the user's request explicitly or implicitly references past work, historical configurations, prior discussions, or unresolved context (e.g., words like '之前', '上次', '记得', '以前', '曾经', 'earlier', 'we configured', 'last time'), you MUST include 'search-memory' in focus_skills and/or 'memory_recall' in focus_tools if present in the catalog.
+CRITICAL RULES:
+1. "intent" and "allow_write":
+   - "analytical": The user asks to inspect, check, review, compare, investigate, find, analyze, or explain WITHOUT asking to modify code. Examples: "检查...", "看看...", "排查...", "分析...", "为什么...", "check...", "inspect...", "review...". In analytical mode, "allow_write" MUST be false. Modifying files (edit/write) is strictly forbidden.
+   - "execution": The user explicitly asks to modify, create, fix, refactor, implement, or delete code/files. "allow_write" is true.
+   - "composite": The user gives a multi-stage task (e.g. "first check X, then if Y fix Z"). "allow_write" is true only if modification is needed.
+2. "reason":
+   - A short, 1-sentence explanation of the task classification.
+3. "clarified_intent":
+   - A concise, normalized statement of what the user is actually asking for, written in the user's language. Correct any typos, colloquialisms, or ambiguous phrasing into a clear operational intent.
+4. "typo_corrections":
+   - List any suspected typos, phonetically mistyped words, or slip-of-the-pen in the user's message and their corrected forms (e.g. ["plgu -> plug", "dcoment -> document"]). If none, return []. NEVER treat terms in "protected_terms" as typos.
+5. "protected_terms":
+   - Extract all domain jargon, package/tool names, identifiers, custom terms, or unusual proper nouns present in the request or context (e.g., "nowledge-mem", "pi-hashline-edit-pro", repo names, unique variables). The agent must NEVER treat these as typos or misspellings.
+6. "focus_tools" & "focus_skills":
+   - Select the minimal subset from the catalog needed for this task.
+
+SPECIAL MEMORY & REPRODUCTION RULE:
+If the user's request explicitly or implicitly references past work, historical configurations, prior discussions, reproduction, or recurring operations (e.g., words like '重新', '再次', '重跑', '复现', '更新', '像上次一样', '之前', '上次', '记得', '以前', '曾经', 'earlier', 'again', 're-run', 'reproduce', 'we configured', 'last time'), you MUST include 'search-memory' and/or 'nowledge-mem' in focus_skills / focus_tools if present in the catalog, to retrieve past working procedures and parameters.
 
 SPECIAL BROWSER & AUTOMATION RULE:
 If the user's task mentions browser operations, web pages, browser profiles, or UI interaction (e.g., '浏览器', '网页', 'profile', 'profiles', 'browser', 'GUI', 'desktop'), include relevant browser/automation skills (e.g., 'ego-browser', 'cua-driver') if present in the catalog.
@@ -948,7 +1162,7 @@ SPECIAL SUBAGENT RULE:
 If the user's task involves delegation, code review, secondary opinions, deep reconnaissance, multi-agent workflows, or mentions subagent roles ('subagent', 'scout', 'reviewer', 'worker', 'oracle', 'delegate', 'review', '审查', '第二意见', '子代理'), you MUST include 'subagent' in focus_tools if present in the catalog.
 
 SPECIAL SEARCH & DISCOVERY RULE:
-If the task involves finding files, locating code symbols, AST searching, or grepping ('find', 'grep', 'search', '定位', '查找', '搜'), include 'find', 'grep', 'ast_grep_search', and/or 'symbol_search' in focus_tools if present in the catalog.
+If the task involves finding files, locating code symbols, AST searching, inspecting existing scripts, or grepping ('find', 'grep', 'search', '定位', '查找', '搜', '脚本', '现成', '已有'), include 'find', 'grep', 'ast_grep_search', and/or 'symbol_search' in focus_tools if present in the catalog.
 
 SPECIAL BACKGROUND TASKS RULE:
 If the task involves running servers, background jobs, test suites, builds, or long-running processes ('bg_run', 'background', '后台', '长命令', '启动服务'), include 'bg_run' and/or 'bg_status' in focus_tools if present in the catalog.
@@ -987,7 +1201,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 								return `${m.role.toUpperCase()}: ${truncated}`;
 							}).join("\n\n");
 						}
-					} catch (e) {
+					} catch (_e) {
 						// ignore history extraction errors
 					}
 
@@ -1005,7 +1219,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 						console.error("[Preflight] Response:", response);
 					}
 					
-					if (response && (Array.isArray(response.focus_tools) || Array.isArray(response.focus_skills))) {
+					if (response && (Array.isArray(response.focus_tools) || Array.isArray(response.focus_skills) || typeof response.intent === "string")) {
 						preflightSucceeded = true;
 						if (Array.isArray(response.focus_tools)) {
 							routedTools = (response.focus_tools as string[]).filter((t) => allTools.some((at) => at.name === t));
@@ -1017,6 +1231,41 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 							needDocs = response.need_docs;
 						}
 
+						const intent = (typeof response.intent === "string" && ["analytical", "execution", "composite"].includes(response.intent))
+							? (response.intent as "analytical" | "execution" | "composite")
+							: (response.allow_write === false ? "analytical" : "execution");
+
+						const allow_write = typeof response.allow_write === "boolean"
+							? response.allow_write
+							: (intent !== "analytical");
+
+						const protected_terms = Array.isArray(response.protected_terms)
+							? (response.protected_terms as string[]).filter((t) => typeof t === "string" && t.trim().length > 0)
+							: [];
+
+						const clarified_intent = typeof response.clarified_intent === "string" ? response.clarified_intent.trim() : "";
+						const typo_corrections = Array.isArray(response.typo_corrections)
+							? (response.typo_corrections as string[]).filter((t) => typeof t === "string" && t.trim().length > 0)
+							: [];
+
+						const contract: TaskContract = {
+							intent,
+							allow_write,
+							reason: typeof response.reason === "string" ? response.reason : "",
+							clarified_intent,
+							typo_corrections,
+							protected_terms,
+							focus_tools: routedTools,
+							focus_skills: routedSkills,
+							need_docs: needDocs,
+							source: "preflight",
+							updatedAt: Date.now(),
+						};
+
+						const globalContracts = ((globalThis as any).__PI_TASK_CONTRACTS__ =
+							(globalThis as any).__PI_TASK_CONTRACTS__ || new Map<string, TaskContract>());
+						globalContracts.set(sessionName, contract);
+
 						const focusSkillsStr = routedSkills.slice(0, 5).join(", ");
 						const focusToolsStr = routedTools.slice(0, 5).join(", ");
 						const hintParts = [];
@@ -1024,15 +1273,68 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 						if (focusToolsStr) hintParts.push(`tools: [${focusToolsStr}]`);
 						if (needDocs) hintParts.push(`docs: [Pi Framework Docs]`);
 						
-						if (hintParts.length > 0) {
-							turnRoutingHints.set(
-								sessionName,
-								`Preflight route: focus on ${hintParts.join(" and ")}. (If historical context is needed, feel free to use memory tools/skills. Always match user's language and requirements for output.)`
-							);
+						let contractHint = `[Task Contract: ${intent.toUpperCase()}${allow_write ? " | WRITE ALLOWED" : " | READ-ONLY (NO WRITES)"}]`;
+						if (clarified_intent) {
+							contractHint += ` Clarified user intent: "${clarified_intent}".`;
 						}
+						if (typo_corrections.length > 0) {
+							contractHint += ` Typo corrections: [${typo_corrections.join(", ")}].`;
+						}
+						if (protected_terms.length > 0) {
+							contractHint += ` Protected terms: [${protected_terms.join(", ")}] (NEVER treat as typos/misspellings).`;
+						}
+						if (!allow_write) {
+							contractHint += ` Current task is inspection-only. DO NOT edit or write code. Report findings directly.`;
+						}
+						const routeHint = hintParts.length > 0 ? ` Focus: ${hintParts.join(" and ")}.` : "";
+
+						const fullDirective = `Preflight route: focus on ${hintParts.join(" and ")}. ${contractHint}${routeHint} (Always match user's language and requirements for output.)`;
+						turnRoutingHints.set(sessionName, fullDirective);
+
+						const modelName = preflightModel?.id || preflightModelStr || "gemini-3.8-flash";
+						const cardLines = [
+							`### 🎯 意图分析与动态路由 (\`${modelName}\`)`,
+							`- **任务意图**: \`${intent.toUpperCase()}\` (${allow_write ? "允许写代码/修改" : "纯分析/只读巡检"})`,
+							`- **判定依据**: ${contract.reason || "无额外说明"}`,
+						];
+						if (clarified_intent) {
+							cardLines.push(`- **规范意图 (3.5 理解)**: ${clarified_intent}`);
+						}
+						if (typo_corrections.length > 0) {
+							cardLines.push(`- **识别纠错 (错别字)**: ${typo_corrections.map((t) => `\`${t}\``).join(", ")}`);
+						}
+						cardLines.push(
+							`- **路由工具**: ${routedTools.length > 0 ? routedTools.map((t) => `\`${t}\``).join(", ") : "无"}`,
+							`- **路由技能**: ${routedSkills.length > 0 ? routedSkills.map((s) => `\`${s}\``).join(", ") : "无"}`
+						);
+						if (protected_terms.length > 0) {
+							cardLines.push(`- **保护术语 (防误判)**: ${protected_terms.map((t) => `\`${t}\``).join(", ")}`);
+						}
+						if (needDocs) {
+							cardLines.push(`- **框架文档**: 已挂载 Pi Framework Docs`);
+						}
+						cardLines.push(`- **下发给 3.8 的指令切片**: \`${contractHint}\``);
+
+						const fullContentGivenTo38 = `<system_directive>${fullDirective}</system_directive>\n\n${event.prompt}`;
+						emitDietStepMessage(pi, _ctx, "prompt-diet:intent", cardLines.join("\n"), {
+							model: modelName,
+							intent,
+							allow_write,
+							reason: contract.reason,
+							clarified_intent,
+							typo_corrections,
+							protected_terms,
+							focus_tools: routedTools,
+							focus_skills: routedSkills,
+							need_docs: needDocs,
+							user_original_prompt: event.prompt,
+							injected_system_directive: fullDirective,
+							full_content_given_to_38: fullContentGivenTo38,
+							timestamp: new Date().toISOString(),
+						});
 					}
 				}
-			} catch (e) {
+			} catch (e: any) {
 				console.error("[Preflight] Error:", e);
 			}
 		}
@@ -1043,6 +1345,28 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 			routedTools = allTools.map((t) => t.name);
 			routedSkills = rawSkills.map((s) => s.name);
 			needDocs = true;
+
+			const globalContracts = ((globalThis as any).__PI_TASK_CONTRACTS__ =
+				(globalThis as any).__PI_TASK_CONTRACTS__ || new Map<string, TaskContract>());
+			globalContracts.set(sessionName, {
+				intent: "execution",
+				allow_write: true,
+				source: "fallback",
+				updatedAt: Date.now(),
+			});
+
+			const fallbackCardLines = [
+				`### 🛡️ 容灾降级模式 (Fail-Open Fallback)`,
+				`- **判定**: 意图预检跳过或异常，已激活容灾回退保护`,
+				`- **安全策略**: 全量保留所有底层工具与技能能力，保障任务不中断`,
+				`- **活跃能力**: 全量 ${allTools.length} 个工具、${rawSkills.length} 个技能全部就绪`,
+			];
+			emitDietStepMessage(pi, _ctx, "prompt-diet:fallback", fallbackCardLines.join("\n"), {
+				fallback: true,
+				totalTools: allTools.length,
+				totalSkills: rawSkills.length,
+				timestamp: new Date().toISOString(),
+			});
 		}
 
 		// ── 4. 物理裁剪底层活跃工具（Required Tools + 语境路由工具） ─────────
@@ -1218,7 +1542,20 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 				: `🌿 [pi-prompt-diet] 提示词装配: ${(finalLength / 1024).toFixed(1)}KB | 工具: ${activeCount}/${totalCount} 活跃 (${routingDetail})`;
 
 			notifyDiet(_ctx, dietMsg, "info");
-			updateDietStatus(_ctx, savedChars > 0 ? `🌿 Diet: -${percent}% (${(finalLength / 1024).toFixed(1)}KB)` : `🌿 Diet: ${(finalLength / 1024).toFixed(1)}KB`);
+			updateDietStatus(_ctx, savedChars > 0 ? `🌿 Diet: -${percent}% (${(finalLength / 1024).toFixed(1)}KB) | 工具: ${activeCount}/${totalCount}` : `🌿 Diet: ${(finalLength / 1024).toFixed(1)}KB | 工具: ${activeCount}/${totalCount}`);
+
+			const widgetLines = [
+				`🌿 Prompt Diet: ${(initialPromptLength / 1024).toFixed(1)}KB ➔ ${(finalLength / 1024).toFixed(1)}KB (-${percent}%, 估省 ~${estTokens} tok)`,
+				`├─ 工具精简: ${activeCount}/${totalCount} 活跃 (${routingDetail})`,
+			];
+			if (stats.scrubbedSavedChars > 0) {
+				widgetLines.push(`├─ 历史清理: 已累计瘦身 ${(stats.scrubbedSavedChars / 1024).toFixed(0)}KB (${stats.scrubbedToolResultsCount} 条输出已削减)`);
+			}
+			if (neededSkills.size > 0) {
+				widgetLines.push(`├─ 动态技能: ${Array.from(neededSkills).join(", ")}`);
+			}
+			widgetLines.push(`└─ 状态: 最新轮次已优化`);
+			updateDietWidget(_ctx, widgetLines);
 		}
 
 		if (process.env.DEBUG) {

@@ -108,6 +108,8 @@ function createHarness(complete, extraTools = [], configOverride = {}) {
 		},
 		registeredToolDefs,
 		ctx,
+		pi,
+		getActiveTools: () => activeTools,
 	};
 }
 
@@ -434,6 +436,29 @@ test("call_tool meta-tool executes inactive tools directly in a single turn", as
 	assert.equal(res.content[0].text, "Success: bar");
 });
 
+test("call_tool safely activates metadata-only tools (like lens_diagnostics) without throwing TypeError", async () => {
+	const metadataTool = {
+		name: "lens_diagnostics",
+		description: "Project diagnostics",
+		parameters: { type: "object", properties: { mode: { type: "string" } } },
+		promptGuidelines: [],
+		sourceInfo: { source: "pi-lens" },
+		// Notice: NO execute method, simulating real Pi getAllTools() behavior!
+	};
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: "{}" }],
+	}), [metadataTool], { adaptive: { softRouting: false } });
+
+	const callToolDef = harness.registeredToolDefs.get("call_tool");
+	assert.ok(callToolDef, "call_tool should be registered");
+
+	const res = await callToolDef.execute("call-2", { tool: "lens_diagnostics", parameters: { mode: "delta" } }, undefined, undefined, harness.ctx);
+	assert.equal(res.isError, false);
+	assert.match(res.content[0].text, /successfully activated/);
+	assert.ok(harness.getActiveTools().includes("lens_diagnostics"));
+});
+
 test("promptDiet removes Pi default 'Use bash for file operations like ls, rg, find' guideline", async () => {
 	const harness = createHarness(async () => ({
 		stopReason: "stop",
@@ -729,6 +754,49 @@ test("expanded continuation phrases match affirmative follow-ups without preflig
 	}
 
 	assert.equal(completions, 0, "All affirmative continuation phrases must bypass preflight LLM");
+});
+
+test("preflight generates TaskContract, publishes to global store, and injects protected terms into context", async () => {
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{
+			type: "text",
+			text: JSON.stringify({
+				intent: "analytical",
+				allow_write: false,
+				reason: "Checking nowledge-mem integration",
+				protected_terms: ["nowledge-mem"],
+				focus_tools: ["read", "find"],
+				focus_skills: [],
+				need_docs: false,
+			}),
+		}],
+	}), [], { adaptive: { softRouting: true } });
+
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	const sessionKey = harness.ctx.sessionManager?.getSessionId?.() || harness.ctx.cwd;
+
+	await harness.emit("before_agent_start", {
+		prompt: "pi-prompt-diet 对 nowledge-mem 的依赖检查",
+		systemPrompt: "Base prompt with tools:\n- read: Read\n- edit: Edit\n<available_skills></available_skills>",
+		systemPromptOptions: { skills: [] },
+	}, harness.ctx);
+
+	// 1. Verify globalThis.__PI_TASK_CONTRACTS__ contains the generated contract
+	const contract = globalThis.__PI_TASK_CONTRACTS__?.get(sessionKey);
+	assert.ok(contract, "TaskContract should be recorded in global store");
+	assert.equal(contract.intent, "analytical");
+	assert.equal(contract.allow_write, false);
+	assert.deepEqual(contract.protected_terms, ["nowledge-mem"]);
+
+	// 2. Verify context event injects contract hint and protected terms
+	const messages = [{ role: "user", content: [{ type: "text", text: "pi-prompt-diet 对 nowledge-mem 的依赖检查" }] }];
+	const contextRes = await harness.emit("context", { messages }, harness.ctx);
+	const directiveText = contextRes.messages[0].content[0].text;
+	assert.match(directiveText, /<system_directive>/);
+	assert.match(directiveText, /Task Contract: ANALYTICAL \| READ-ONLY \(NO WRITES\)/);
+	assert.match(directiveText, /Protected terms: \[nowledge-mem\]/);
+	assert.match(directiveText, /DO NOT edit or write code/);
 });
 
 test.after(() => rmSync(testHome, { recursive: true, force: true }));
