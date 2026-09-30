@@ -95,19 +95,13 @@ function emitDietStepMessage(
 	content: string,
 	details?: unknown
 ) {
-	const msg = {
-		customType,
-		content,
-		display: true,
-		details,
-	};
 	try {
-		if (typeof (pi as any).sendMessage === "function") {
-			(pi as any).sendMessage(msg, { triggerTurn: false });
-		} else if (typeof (ctx as any)?.sendMessage === "function") {
-			(ctx as any).sendMessage(msg, { triggerTurn: false });
-		} else if (ctx?.sessionManager?.appendCustomMessageEntry) {
-			ctx.sessionManager.appendCustomMessageEntry(msg.customType, msg.content, msg.display, msg.details);
+		// Pure ephemeral UI notification: displays message reminder on pi-web and TUI
+		// Never writes to session.jsonl (no appendCustomMessageEntry or sendMessage)
+		const ui = ctx?.ui || (pi as any)?.ui;
+		if (typeof ui?.notify === "function") {
+			const level = customType.includes("blocked") || customType.includes("fallback") ? "warning" : "info";
+			ui.notify(content, level);
 		}
 	} catch (e) {
 		console.error("[pi-prompt-diet] emitDietStepMessage error:", e);
@@ -153,9 +147,8 @@ function notifyDiet(
 	message: string,
 	level: "info" | "warning" | "error" = "info"
 ) {
-	// Routine info is displayed via setStatus / setWidget on pi-web and TUI.
-	// Only popup notifications for warnings or errors to keep pi-web clean.
-	if (level !== "info" && (ctx as any)?.hasUI && (ctx as any).ui?.notify) {
+	// Directly emit floating notification toast on pi-web and TUI without touching jsonl
+	if ((ctx as any)?.hasUI && (ctx as any).ui?.notify) {
 		(ctx as any).ui.notify(message, level);
 	}
 	if (!(ctx as any)?.hasUI || process.env.DEBUG) {
