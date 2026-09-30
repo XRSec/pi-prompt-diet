@@ -163,9 +163,10 @@ function updateDietStatus(ctx: ExtensionContext, _text: string | undefined) {
 	}
 }
 
-function updateDietWidget(ctx: ExtensionContext, lines: string[] | undefined) {
+function updateDietWidget(ctx: ExtensionContext, _lines: string[] | undefined) {
+	// Widget display disabled per user preference
 	if ((ctx as any)?.hasUI && typeof (ctx as any).ui?.setWidget === "function") {
-		(ctx as any).ui.setWidget("prompt-diet", lines);
+		(ctx as any).ui.setWidget("prompt-diet", undefined);
 	}
 }
 
