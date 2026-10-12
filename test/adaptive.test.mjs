@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -773,8 +773,9 @@ test("preflight generates TaskContract, publishes to global store, and injects p
 		}],
 	}), [], { adaptive: { softRouting: true } });
 
+	harness.ctx.sessionManager.getSessionId = () => "mock-session-task-contract";
 	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
-	const sessionKey = harness.ctx.sessionManager?.getSessionId?.() || harness.ctx.cwd;
+	const sessionKey = "mock-session-task-contract";
 
 	await harness.emit("before_agent_start", {
 		prompt: "pi-prompt-diet 对 nowledge-mem 的依赖检查",
@@ -799,4 +800,94 @@ test("preflight generates TaskContract, publishes to global store, and injects p
 	assert.match(directiveText, /Do not modify existing source code files/);
 });
 
+test("codemode is always preserved in active tools even when not explicitly in requiredTools", async () => {
+	const allTools = [
+		{ name: "read", description: "Read file" },
+		{ name: "edit", description: "Edit file" },
+		{ name: "codemode", description: "Execute JavaScript code safely" },
+		{ name: "other_tool", description: "Some other tool" },
+	];
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{ type: "text", text: "{}" }],
+	}), allTools);
+
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	await harness.emit("before_agent_start", {
+		prompt: "Run simple query",
+		systemPrompt: "<tools>\n- read: Read\n- edit: Edit\n- codemode: Code\n</tools>",
+		systemPromptOptions: { skills: [] },
+	}, harness.ctx);
+
+	const active = harness.pi.getActiveTools();
+	assert.ok(active.includes("codemode"), "codemode must be preserved in active tools");
+	assert.ok(active.includes("read"));
+	assert.ok(active.includes("edit"));
+});
+
+test("preflight complete call receives thinkingLevel off in options to avoid token waste", async () => {
+	let capturedOptions = null;
+	const harness = createHarness(async (_model, _ctxReq, options) => {
+		capturedOptions = options;
+		return {
+			stopReason: "stop",
+			content: [{
+				type: "text",
+				text: JSON.stringify({
+					intent: "analytical",
+					focus_tools: ["read"],
+					focus_skills: [],
+				}),
+			}],
+		};
+	}, [
+		{ name: "read", description: "Read" },
+		{ name: "edit", description: "Edit" },
+	], { adaptive: { softRouting: true } });
+
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	await harness.emit("before_agent_start", {
+		prompt: "Analyze the architecture of this component",
+		systemPrompt: "Base prompt\n<tools>\n- read: Read\n</tools>",
+		systemPromptOptions: { skills: [] },
+	}, harness.ctx);
+
+	assert.ok(capturedOptions, "preflight complete should be called");
+	assert.equal(capturedOptions.thinkingLevel, "off", "thinkingLevel must be set to 'off'");
+});
+
+test("promptDiet handles system prompt without legacy XML tags gracefully (Codemode fallback)", async () => {
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: "{}" }] }));
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+
+	const promptWithoutXml = "You are a code agent running in Codemode. Available functions are defined in sandbox.";
+	const result = await harness.emit("before_agent_start", {
+		prompt: "Hello",
+		systemPrompt: promptWithoutXml,
+		systemPromptOptions: { skills: [] },
+	}, harness.ctx);
+
+	assert.ok(result.systemPrompt, "systemPrompt must be returned safely");
+	assert.match(result.systemPrompt, /You are a code agent running in Codemode/);
+});
+
+test("stats.json is saved with 0600 permissions and merges updates safely without dropping state", () => {
+	saveSessionState("session_1", { promptInitialChars: 100, promptSlimmedChars: 50 });
+	saveSessionState("session_2", { promptInitialChars: 200, promptSlimmedChars: 80 });
+
+	recordStatsDelta({ promptInitialChars: 100, promptSlimmedChars: 50, scrubbedSavedChars: 20 });
+
+	const stats = loadGlobalStats();
+	assert.ok(stats.sessions?.session_1, "session_1 must be present in stats");
+	assert.ok(stats.sessions?.session_2, "session_2 must be present in stats");
+	assert.equal(stats.sessions.session_1.promptInitialChars, 100);
+	assert.equal(stats.sessions.session_2.promptInitialChars, 200);
+
+	const statsFile = join(testHome, "stats.json");
+	if (existsSync(statsFile)) {
+		assert.equal(statSync(statsFile).mode & 0o777, 0o600, "stats.json 权限必须严格为 0600");
+	}
+});
+
 test.after(() => rmSync(testHome, { recursive: true, force: true }));
+

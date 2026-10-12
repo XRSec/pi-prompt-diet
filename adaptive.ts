@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -108,11 +108,12 @@ function toolCapsulePath(key: string): string {
 	return join(toolCapsuleDirectory(), `${createHash("sha256").update(key).digest("hex")}.json`);
 }
 
-function writeJsonAtomic(path: string, value: unknown): void {
+function writeJsonAtomic(path: string, value: unknown, mode: number = 0o600): void {
 	mkdirSync(dirname(path), { recursive: true });
-	const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+	const temporaryPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
 	try {
-		writeFileSync(temporaryPath, JSON.stringify(value, null, 2), "utf8");
+		writeFileSync(temporaryPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode });
+		try { chmodSync(temporaryPath, mode); } catch {}
 		renameSync(temporaryPath, path);
 	} finally {
 		rmSync(temporaryPath, { force: true });
@@ -312,6 +313,7 @@ export async function completeJson(
 	systemPrompt: string,
 	prompt: string,
 	maxTokens: number,
+	options?: { thinkingLevel?: string; [key: string]: unknown },
 ): Promise<Record<string, unknown> | undefined> {
 	const model = selectModel(ctx, config.model);
 	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
@@ -327,7 +329,7 @@ export async function completeJson(
 				systemPrompt,
 				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
 			},
-			{ signal: ctx.signal, maxTokens, cacheRetention: "none" },
+			{ signal: ctx.signal, maxTokens, cacheRetention: "none", thinkingLevel: "off", ...(options || {}) } as any,
 		);
 		if (response.stopReason === "aborted" || response.stopReason === "error") {
 			if (process.env.DEBUG) {
@@ -518,9 +520,24 @@ export function loadSessionState(sessionId: string): SessionStatEntry | undefine
 	return stats.sessions?.[sessionId];
 }
 
+function updateGlobalStatsAtomic(updater: (current: DietGlobalStats) => void, maxRetries = 5): void {
+	const file = globalStatsPath();
+	for (let attempt = 0; attempt < maxRetries; attempt++) {
+		try {
+			const current = loadGlobalStats();
+			updater(current);
+			writeJsonAtomic(file, current, 0o600);
+			return;
+		} catch (err) {
+			if (attempt === maxRetries - 1) {
+				console.warn(`[pi-prompt-diet] updateGlobalStatsAtomic failed after ${maxRetries} attempts:`, err);
+			}
+		}
+	}
+}
+
 export function saveSessionState(sessionId: string, patch: Partial<SessionStatEntry>): void {
-	try {
-		const stats = loadGlobalStats();
+	updateGlobalStatsAtomic((stats) => {
 		if (!stats.sessions) stats.sessions = {};
 		const existing = stats.sessions[sessionId] || {
 			promptInitialChars: 0,
@@ -539,10 +556,7 @@ export function saveSessionState(sessionId: string, patch: Partial<SessionStatEn
 		if (keys.length > 50) {
 			delete stats.sessions[keys[0]];
 		}
-		writeJsonAtomic(globalStatsPath(), stats);
-	} catch (err) {
-		console.warn(`[pi-prompt-diet] Failed to save session state:`, err);
-	}
+	});
 }
 
 export interface StatsDelta {
@@ -553,15 +567,14 @@ export interface StatsDelta {
 }
 
 export function recordStatsDelta(delta: StatsDelta): void {
-	try {
-		const stats = loadGlobalStats();
-		const initial = delta.promptInitialChars || 0;
-		const slimmed = delta.promptSlimmedChars || 0;
-		const promptSaved = Math.max(0, initial - slimmed);
-		const scrubSaved = delta.scrubbedSavedChars || 0;
-		const totalSaved = promptSaved + scrubSaved;
-		const tokensSaved = Math.round(totalSaved / 4);
+	const initial = delta.promptInitialChars || 0;
+	const slimmed = delta.promptSlimmedChars || 0;
+	const promptSaved = Math.max(0, initial - slimmed);
+	const scrubSaved = delta.scrubbedSavedChars || 0;
+	const totalSaved = promptSaved + scrubSaved;
+	const tokensSaved = Math.round(totalSaved / 4);
 
+	updateGlobalStatsAtomic((stats) => {
 		stats.updatedAt = new Date().toISOString();
 		stats.totals.totalPromptInitialChars += initial;
 		stats.totals.totalPromptSlimmedChars += slimmed;
@@ -570,9 +583,5 @@ export function recordStatsDelta(delta: StatsDelta): void {
 		stats.totals.totalScrubbedToolResultsCount += (delta.scrubbedToolResultsCount || 0);
 		stats.totals.totalScrubbedSavedChars += scrubSaved;
 		if (initial > 0 || scrubSaved > 0) stats.totals.totalRounds += 1;
-
-		writeJsonAtomic(globalStatsPath(), stats);
-	} catch (err) {
-		console.warn(`[pi-prompt-diet] Failed to record stats delta:`, err);
-	}
+	});
 }

@@ -119,7 +119,24 @@ interface SessionStats {
 }
 
 function getSessionKey(ctx: ExtensionContext): string {
-	return ctx.sessionManager?.getSessionId?.() || ctx.sessionManager?.getSessionName?.() || ctx.cwd || "default";
+	const sessionId = ctx.sessionManager?.getSessionId?.();
+	if (sessionId && typeof sessionId === "string" && sessionId.trim()) {
+		return sessionId;
+	}
+	const sessionFile = ctx.sessionManager?.getSessionFile?.();
+	if (sessionFile && typeof sessionFile === "string" && sessionFile.trim()) {
+		return resolve(sessionFile);
+	}
+	const sessionName = ctx.sessionManager?.getSessionName?.();
+	if (sessionName && typeof sessionName === "string" && sessionName.trim()) {
+		return sessionName;
+	}
+	if ((ctx as any).__dietSessionKey) {
+		return (ctx as any).__dietSessionKey;
+	}
+	const anonKey = `anon_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+	(ctx as any).__dietSessionKey = anonKey;
+	return anonKey;
 }
 
 const sessionStatsMap = new Map<string, SessionStats>();
@@ -173,17 +190,38 @@ function updateDietWidget(ctx: ExtensionContext, _lines: string[] | undefined) {
 // Lean primitive baseline: read, write, bash, edit, find, grep.
 // Advanced capabilities (replace/hashline, bg_run, subagent)
 // are dynamically activated on-demand via semantic preflight routing or call_tool.
-const DEFAULT_REQUIRED_TOOLS = [
+export const DEFAULT_REQUIRED_TOOLS = [
 	"read",
 	"write",
 	"bash",
 	"edit",
 	"find",
 	"grep",
+	"codemode",
 ];
 
 function unique(values: Iterable<string>): string[] {
 	return [...new Set(values)];
+}
+
+export function resolveActiveTools(
+	allTools: Array<{ name: string; [key: string]: unknown }>,
+	routedTools: string[] = [],
+	requiredTools?: string[],
+): string[] {
+	const baseRequired = Array.isArray(requiredTools) && requiredTools.length > 0
+		? requiredTools
+		: DEFAULT_REQUIRED_TOOLS;
+
+	const hasCodemode = allTools.some((t) => t.name === "codemode");
+
+	return unique([
+		...baseRequired,
+		...routedTools,
+		CALL_TOOL,
+		REQUEST_CAPABILITIES_TOOL,
+		...(hasCodemode ? ["codemode"] : []),
+	]).filter((name) => allTools.some((t) => t.name === name));
 }
 
 function extractExplicitSkills(prompt: string): string[] {
@@ -1213,7 +1251,8 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 						{ ...(config.adaptive ?? {}), model: preflightModelStr ?? config.adaptive?.model },
 						systemAnalysisPrompt,
 						userAnalysisPrompt,
-						800
+						800,
+						{ thinkingLevel: "off" },
 					);
 					if (process.env.DEBUG) {
 						console.error("[Preflight] Response:", response);
@@ -1373,16 +1412,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 		const explicitSkills = extractExplicitSkills(event.prompt);
 		const neededSkills = new Set([...explicitSkills, ...routedSkills]);
 
-		const baseRequired = Array.isArray(config.requiredTools) && config.requiredTools.length > 0
-			? config.requiredTools
-			: DEFAULT_REQUIRED_TOOLS;
-
-		const activeToolNames = unique([
-			...baseRequired,
-			...routedTools,
-			CALL_TOOL,
-			REQUEST_CAPABILITIES_TOOL,
-		]).filter((name) => allTools.some((t) => t.name === name));
+		const activeToolNames = resolveActiveTools(allTools, routedTools, config.requiredTools);
 
 		try {
 			pi.setActiveTools(activeToolNames);
