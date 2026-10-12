@@ -1134,9 +1134,10 @@ Analyze the user's latest request and context, then return ONLY a JSON object wi
 
 CRITICAL RULES:
 1. "intent" and "allow_write":
-   - "analytical": The user asks to inspect, check, review, compare, investigate, find, analyze, or explain WITHOUT asking to modify code. Examples: "检查...", "看看...", "排查...", "分析...", "为什么...", "check...", "inspect...", "review...". In analytical mode, "allow_write" MUST be false. Modifying files (edit/write) is strictly forbidden.
-   - "execution": The user explicitly asks to modify, create, fix, refactor, implement, or delete code/files. "allow_write" is true.
-   - "composite": The user gives a multi-stage task (e.g. "first check X, then if Y fix Z"). "allow_write" is true only if modification is needed.
+   - "analytical": The user asks ONLY to inspect, check, review, compare, investigate, or explain code/config — with NO request to run scripts, fetch data, or produce output beyond verbal findings. Examples: "检查这个函数...", "看看代码有没有问题", "为什么报错", "review this PR". In analytical mode, "allow_write" MUST be false.
+   - "execution": The user asks to run/execute a script, fetch/scrape/collect data, modify/create/fix/refactor/implement/delete code/files, or invoke an existing automation. "allow_write" is true. KEY: running an existing script (e.g. "@ego-script/xxx", "node xxx.mjs", "执行xxx", "运行xxx", "获取xxx", "抓取xxx", "爬取xxx") is ALWAYS execution even if followed by analysis words like "然后分析/总结".
+   - "composite": The user gives a multi-stage task (e.g. "first check X, then if Y fix Z"). If ANY stage involves execution or modification, "allow_write" MUST be true.
+   PRIORITY RULE: When the request contains BOTH execution verbs (运行/获取/执行/抓取/爬取/run/fetch/scrape) AND analytical verbs (分析/总结/检查/review), the PRIMARY intent is determined by the FIRST action verb. "获取X然后分析" = execution (not analytical). "分析X的代码" = analytical.
 2. "reason":
    - A short, 1-sentence explanation of the task classification.
 3. "clarified_intent":
@@ -1162,6 +1163,9 @@ If the task involves finding files, locating code symbols, AST searching, inspec
 
 SPECIAL BACKGROUND TASKS RULE:
 If the task involves running servers, background jobs, test suites, builds, or long-running processes ('bg_run', 'background', '后台', '长命令', '启动服务'), include 'bg_run' and/or 'bg_status' in focus_tools if present in the catalog.
+
+SPECIAL SCRIPT INVOCATION RULE:
+If the user's message references a script via "@" prefix (e.g., "@ego-script/read_twitter.mjs"), "node xxx.mjs", or similar direct invocation patterns, this is ALWAYS an "execution" task with "allow_write": true. The agent should execute the script directly (black-box), NOT read its full source code. Only the script header/usage (top 20-30 lines) may be read to understand CLI arguments.
 
 SPECIAL DOCS RULE:
 If the user's task asks about or involves the Pi coding agent framework itself (e.g. its SDK, extensions, themes, skills, CLI flags, internal APIs, or subprocess testing), set need_docs to true. Otherwise set need_docs to false.`;
@@ -1280,7 +1284,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 							contractHint += ` Protected terms: [${protected_terms.join(", ")}] (NEVER treat as typos/misspellings).`;
 						}
 						if (!allow_write) {
-							contractHint += ` Current task is inspection-only. DO NOT edit or write code. Report findings directly.`;
+							contractHint += ` Do not modify existing source code files. Script execution and data collection are permitted. Report analytical findings directly.`;
 						}
 						const routeHint = hintParts.length > 0 ? ` Focus: ${hintParts.join(" and ")}.` : "";
 

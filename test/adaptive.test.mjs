@@ -796,7 +796,7 @@ test("preflight generates TaskContract, publishes to global store, and injects p
 	assert.match(directiveText, /<system_directive>/);
 	assert.match(directiveText, /Task Contract: ANALYTICAL \| READ-ONLY \(NO WRITES\)/);
 	assert.match(directiveText, /Protected terms: \[nowledge-mem\]/);
-	assert.match(directiveText, /DO NOT edit or write code/);
+	assert.match(directiveText, /Do not modify existing source code files/);
 });
 
 test.after(() => rmSync(testHome, { recursive: true, force: true }));
