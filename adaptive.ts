@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -520,17 +520,42 @@ export function loadSessionState(sessionId: string): SessionStatEntry | undefine
 	return stats.sessions?.[sessionId];
 }
 
-function updateGlobalStatsAtomic(updater: (current: DietGlobalStats) => void, maxRetries = 5): void {
+function updateGlobalStatsAtomic(updater: (current: DietGlobalStats) => void, maxRetries = 10): void {
 	const file = globalStatsPath();
+	const lockFile = `${file}.lock`;
+	mkdirSync(dirname(file), { recursive: true });
+
 	for (let attempt = 0; attempt < maxRetries; attempt++) {
+		let lockAcquired = false;
 		try {
+			writeFileSync(lockFile, String(process.pid), { flag: "wx" });
+			lockAcquired = true;
+
 			const current = loadGlobalStats();
 			updater(current);
 			writeJsonAtomic(file, current, 0o600);
 			return;
-		} catch (err) {
+		} catch (err: any) {
+			if (!lockAcquired && existsSync(lockFile)) {
+				try {
+					const stat = statSync(lockFile);
+					if (Date.now() - stat.mtimeMs > 2000) {
+						rmSync(lockFile, { force: true });
+					}
+				} catch {}
+			}
 			if (attempt === maxRetries - 1) {
 				console.warn(`[pi-prompt-diet] updateGlobalStatsAtomic failed after ${maxRetries} attempts:`, err);
+			} else {
+				const delay = 10 + Math.floor(Math.random() * 20);
+				const end = Date.now() + delay;
+				while (Date.now() < end) {}
+			}
+		} finally {
+			if (lockAcquired) {
+				try {
+					rmSync(lockFile, { force: true });
+				} catch {}
 			}
 		}
 	}

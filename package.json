@@ -1,7 +1,7 @@
 {
   "name": "pi-prompt-diet",
-  "version": "3.0.1",
-  "description": "An adaptive capability router for Pi with progressive tool-guideline and Skill distillation.",
+  "version": "3.2.0",
+  "description": "An adaptive capability router and prompt cache optimizer for Pi (>= 1.2.0) with native section diffing, deterministic caching, and progressive distillation.",
   "type": "module",
   "main": "index.ts",
   "license": "MIT",
@@ -21,7 +21,9 @@
     "prompt-optimizer",
     "token-reduction",
     "context-window",
-    "llm"
+    "llm",
+    "prompt-cache",
+    "cache-optimizer"
   ],
   "files": [
     "index.ts",
@@ -40,6 +42,6 @@
     "test": "node --experimental-strip-types --test test/*.test.mjs"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": ">=1.2.0"
   }
 }

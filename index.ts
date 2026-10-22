@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -131,6 +132,9 @@ function getSessionKey(ctx: ExtensionContext): string {
 	if (sessionName && typeof sessionName === "string" && sessionName.trim()) {
 		return sessionName;
 	}
+	if (ctx.cwd && typeof ctx.cwd === "string" && ctx.cwd.trim()) {
+		return resolve(ctx.cwd);
+	}
 	if ((ctx as any).__dietSessionKey) {
 		return (ctx as any).__dietSessionKey;
 	}
@@ -200,6 +204,36 @@ export const DEFAULT_REQUIRED_TOOLS = [
 	"codemode",
 ];
 
+export const CANONICAL_TOOL_ORDER: Record<string, number> = {
+	read: 10,
+	write: 20,
+	edit: 30,
+	replace: 40,
+	insert: 50,
+	undo: 60,
+	bash: 70,
+	find: 80,
+	grep: 90,
+	ast_grep_search: 100,
+	symbol_search: 110,
+	codemode: 120,
+	bg_run: 130,
+	bg_status: 140,
+	subagent: 150,
+	ask_user_question: 160,
+	call_tool: 170,
+	request_capabilities: 180,
+};
+
+export function sortToolsDeterministically(toolNames: string[]): string[] {
+	return [...toolNames].sort((a, b) => {
+		const orderA = CANONICAL_TOOL_ORDER[a] ?? 1000;
+		const orderB = CANONICAL_TOOL_ORDER[b] ?? 1000;
+		if (orderA !== orderB) return orderA - orderB;
+		return a.localeCompare(b);
+	});
+}
+
 function unique(values: Iterable<string>): string[] {
 	return [...new Set(values)];
 }
@@ -213,15 +247,14 @@ export function resolveActiveTools(
 		? requiredTools
 		: DEFAULT_REQUIRED_TOOLS;
 
-	const hasCodemode = allTools.some((t) => t.name === "codemode");
-
-	return unique([
+	const tools = unique([
 		...baseRequired,
 		...routedTools,
 		CALL_TOOL,
 		REQUEST_CAPABILITIES_TOOL,
-		...(hasCodemode ? ["codemode"] : []),
 	]).filter((name) => allTools.some((t) => t.name === name));
+
+	return sortToolsDeterministically(tools);
 }
 
 function extractExplicitSkills(prompt: string): string[] {
@@ -541,6 +574,11 @@ export default function promptDiet(pi: ExtensionAPI) {
 				required: ["tool", "parameters"],
 				additionalProperties: false,
 			} as any,
+			// Pi v1.2.0: declare which tools this meta-tool can reach
+			reachesTools: (input: Record<string, unknown>) => {
+				const tool = input.tool;
+				return typeof tool === "string" ? [tool] : "all";
+			},
 			async execute(toolCallId: string, params: { tool: string; parameters?: Record<string, unknown> }, signal: any, onUpdate: any, ctx: ExtensionContext) {
 				const allTools = pi.getAllTools();
 				const target = allTools.find((t) => t.name === params.tool);
@@ -1033,7 +1071,39 @@ function maskSessionId(id: string): string {
 		}
 	});
 
+	// ── 3. Provider Request Optimization (OpenAI-compatible Cache Key & Deterministic Tools) ──
+	(pi as any).on("before_provider_request", (event: any, ctx: ExtensionContext) => {
+		const payload = event?.payload;
+		if (!payload || typeof payload !== "object") return;
+
+		// 3.1 保守补充 OpenAI-Compatible prompt_cache_key (参考 pi-cache-optimizer)
+		// 避免多账号或第三方反代渠道（OneAPI/NewAPI/CPA）因缺少 key 导致 KV Cache 击穿
+		if (!payload.prompt_cache_key) {
+			const sessionKey = getSessionKey(ctx);
+			const hash = createHash("sha256").update(sessionKey).digest("hex").slice(0, 32);
+			payload.prompt_cache_key = `pi-${hash}`;
+		}
+
+		// 3.2 保证 payload.tools 中工具定义的确定性排序，保护大模型底层 KV Cache 前缀
+		if (Array.isArray(payload.tools) && payload.tools.length > 1) {
+			payload.tools.sort((a: any, b: any) => {
+				const nameA = a?.function?.name || a?.name || "";
+				const nameB = b?.function?.name || b?.name || "";
+				const orderA = CANONICAL_TOOL_ORDER[nameA] ?? 1000;
+				const orderB = CANONICAL_TOOL_ORDER[nameB] ?? 1000;
+				if (orderA !== orderB) return orderA - orderB;
+				return nameA.localeCompare(nameB);
+			});
+		}
+	});
+
 	pi.on("before_agent_start", async (event, _ctx) => {
+		// Pi v1.2.0: BeforeAgentStartEvent = BeforeAgentStartUserEvent | BeforeAgentStartCustomEvent
+		// Custom-message triggers (pi.sendMessage with triggerTurn) have no user prompt to route.
+		if ("messageType" in event && (event as any).messageType === "custom") {
+			return undefined;
+		}
+
 		const cwd = _ctx.cwd || process.cwd();
 		const config = loadConfig(cwd);
 		if (process.env.DEBUG) {
@@ -1422,6 +1492,31 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 
 		// ── 5. 重写 System Prompt 中的工具段落、Guidelines 段落、文档段落与技能段落 ────
 		const activeToolsSet = new Set(activeToolNames);
+		const inactiveToolNames = allTools
+			.map((t) => t.name)
+			.filter((name) => !activeToolsSet.has(name) && name !== REQUEST_CAPABILITIES_TOOL && name !== CALL_TOOL);
+
+		// ── 5.1 Pi 1.2.0+ 原生 Mutable SystemPromptOptions 同步 ───────────────
+		if (event.systemPromptOptions) {
+			// 设置活跃工具与隐藏声明 (保持工具与底层一致)
+			event.systemPromptOptions.selectedTools = [...activeToolNames];
+			if (Array.isArray((event.systemPromptOptions as any).hiddenTools)) {
+				(event.systemPromptOptions as any).hiddenTools = Array.from(new Set([
+					...((event.systemPromptOptions as any).hiddenTools || []),
+					...inactiveToolNames,
+				]));
+			} else {
+				(event.systemPromptOptions as any).hiddenTools = [...inactiveToolNames];
+			}
+
+			// 规则治理：剥离 "Use bash for file operations" 冲突项
+			if (Array.isArray(event.systemPromptOptions.promptGuidelines)) {
+				event.systemPromptOptions.promptGuidelines = event.systemPromptOptions.promptGuidelines.filter(
+					(g) => !/Use bash (or PowerShell )?for file operations/i.test(g)
+				);
+			}
+		}
+
 		prompt = rewriteAvailableTools(prompt, activeToolsSet, allTools);
 
 		// Guidelines 处理：保留核心准则 + 属于活跃工具集的第三方工具准则（或其蒸馏胶囊）
@@ -1488,7 +1583,7 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 		const skillsStart = prompt.indexOf("<available_skills>");
 		const skillsEnd = prompt.indexOf("</available_skills>");
 		if (skillsStart !== -1 && skillsEnd !== -1) {
-			const promptSkills = event.systemPromptOptions?.skills || [];
+			const promptSkills = rawSkills;
 			const activeSkillBlocks: string[] = [];
 			const inactiveSkillNames: string[] = [];
 
@@ -1535,6 +1630,20 @@ If the user's task asks about or involves the Pi coding agent framework itself (
 				}
 			} else {
 				prompt = prompt.slice(0, skillsStart) + slimSkillsSection + prompt.slice(skillsEnd + "</available_skills>".length);
+			}
+		}
+
+		// 同步更新 structured sections（如果运行环境提供 sections）
+		if ((event.systemPromptOptions as any)?.sections) {
+			const sections = (event.systemPromptOptions as any).sections;
+			const xmlTools = prompt.match(/<tools>[\s\S]*?<\/tools>/)?.[0];
+			if (xmlTools) sections.tools = xmlTools.replace(/^<tools>\n?/, "").replace(/\n?<\/tools>$/, "");
+			const xmlRules = prompt.match(/<rules>[\s\S]*?<\/rules>/)?.[0];
+			if (xmlRules) sections.rules = xmlRules.replace(/^<rules>\n?/, "").replace(/\n?<\/rules>$/, "");
+			const xmlSkills = prompt.match(/<skills>[\s\S]*?<\/skills>/)?.[0] || prompt.match(/<available_skills>[\s\S]*?<\/available_skills>/)?.[0];
+			if (xmlSkills) sections.skills = xmlSkills.replace(/^<skills>\n?/, "").replace(/\n?<\/skills>$/, "");
+			if (!needDocs && !explicitDocsMentioned && sections.docs) {
+				delete sections.docs;
 			}
 		}
 

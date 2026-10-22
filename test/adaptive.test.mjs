@@ -7,7 +7,7 @@ import test from "node:test";
 const testHome = mkdtempSync(join(tmpdir(), "pi-prompt-diet-test-"));
 process.env.HOME = testHome;
 
-const { default: promptDiet } = await import("../index.ts");
+const { default: promptDiet, resolveActiveTools } = await import("../index.ts");
 const {
 	compactCatalogDescription,
 	distillSkill,
@@ -809,8 +809,8 @@ test("codemode is always preserved in active tools even when not explicitly in r
 	];
 	const harness = createHarness(async () => ({
 		stopReason: "stop",
-		content: [{ type: "text", text: "{}" }],
-	}), allTools);
+		content: [{ type: "text", text: JSON.stringify({ intent: "execution", focus_tools: ["read"] }) }],
+	}), allTools, { adaptive: { softRouting: true } });
 
 	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
 	await harness.emit("before_agent_start", {
@@ -820,9 +820,12 @@ test("codemode is always preserved in active tools even when not explicitly in r
 	}, harness.ctx);
 
 	const active = harness.pi.getActiveTools();
-	assert.ok(active.includes("codemode"), "codemode must be preserved in active tools");
-	assert.ok(active.includes("read"));
-	assert.ok(active.includes("edit"));
+	assert.ok(active.includes("codemode"), "codemode must be preserved in default active tools");
+	assert.ok(active.includes("read"), "read must be active");
+	assert.ok(!active.includes("other_tool"), "other_tool must be trimmed when not routed and not in required tools");
+
+	const userRestricted = resolveActiveTools(allTools, ["read"], ["read"]);
+	assert.ok(!userRestricted.includes("codemode"), "codemode should not be forced if user explicitly configured requiredTools");
 });
 
 test("preflight complete call receives thinkingLevel off in options to avoid token waste", async () => {
@@ -883,10 +886,89 @@ test("stats.json is saved with 0600 permissions and merges updates safely withou
 	assert.equal(stats.sessions.session_1.promptInitialChars, 100);
 	assert.equal(stats.sessions.session_2.promptInitialChars, 200);
 
-	const statsFile = join(testHome, "stats.json");
-	if (existsSync(statsFile)) {
-		assert.equal(statSync(statsFile).mode & 0o777, 0o600, "stats.json 权限必须严格为 0600");
-	}
+	const statsFile = join(testHome, ".pi", "agent", "cache", "pi-prompt-diet", "stats.json");
+	assert.ok(existsSync(statsFile), "stats.json 必须实际存在");
+	assert.equal(statSync(statsFile).mode & 0o777, 0o600, "stats.json 权限必须严格为 0600");
+});
+
+test("before_provider_request injects prompt_cache_key and deterministically sorts payload tools", async () => {
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: "{}" }] }));
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+
+	const payload = {
+		messages: [{ role: "user", content: "Hello" }],
+		tools: [
+			{ name: "subagent", description: "Subagent" },
+			{ name: "read", description: "Read" },
+			{ name: "find", description: "Find" },
+			{ name: "custom_zebra", description: "Custom Zebra" },
+			{ name: "custom_apple", description: "Custom Apple" },
+		],
+	};
+
+	await harness.emit("before_provider_request", { payload }, harness.ctx);
+
+	// 1. 验证 prompt_cache_key 自动补充
+	assert.ok(typeof payload.prompt_cache_key === "string", "prompt_cache_key must be injected");
+	assert.match(payload.prompt_cache_key, /^pi-[a-f0-9]{32}$/, "prompt_cache_key must follow pi-<32-hex> format");
+
+	// 2. 验证确定性排序：read (10) -> find (80) -> subagent (150) -> custom_apple -> custom_zebra
+	const toolNames = payload.tools.map((t) => t.name);
+	assert.deepEqual(toolNames, [
+		"read",
+		"find",
+		"subagent",
+		"custom_apple",
+		"custom_zebra",
+	], "payload.tools must be deterministically sorted according to canonical priority");
+});
+
+test("before_agent_start mutates systemPromptOptions in-place for Pi >= 1.2.0 native section diffing", async () => {
+	const harness = createHarness(async () => ({
+		stopReason: "stop",
+		content: [{
+			type: "text",
+			text: '{"focus_tools":["read","edit"],"focus_skills":[],"need_docs":false}'
+		}]
+	}), [], { adaptive: { softRouting: true } });
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+
+	const options = {
+		selectedTools: ["read", "write", "bash", "edit", "web_search"],
+		hiddenTools: [],
+		promptGuidelines: [
+			"Use bash for file operations like ls, rg, find",
+			"Always be concise",
+		],
+		sections: {
+			tools: "Initial tools",
+			rules: "Initial rules",
+			docs: "Pi framework documentation block",
+			skills: "Initial skills",
+		},
+		skills: [
+			{ name: "needed_skill", description: "Needed", filePath: "/path/to/needed/SKILL.md" },
+			{ name: "unneeded_skill", description: "Unneeded", filePath: "/path/to/unneeded/SKILL.md" },
+		],
+	};
+
+	const event = {
+		prompt: "Refactor this file",
+		systemPrompt: "<tools>\n- read: Read\n</tools>\n<rules>\n- rule\n</rules>\n<docs>\nDocs\n</docs>",
+		systemPromptOptions: options,
+	};
+
+	await harness.emit("before_agent_start", event, harness.ctx);
+
+	// 1. 验证 promptGuidelines 中的冲突项被剥离，保留正常规则
+	assert.ok(!options.promptGuidelines.some((g) => g.includes("Use bash for file operations")), "Bash guideline must be removed from promptGuidelines");
+	assert.ok(options.promptGuidelines.includes("Always be concise"), "Normal guidelines must be preserved");
+
+	// 2. 验证不需要文档且用户未提及 Pi 时，sections.docs 被直接剥离
+	assert.equal(options.sections.docs, undefined, "sections.docs must be deleted when need_docs is false");
+
+	// 3. 验证未激活的工具被记录进 hiddenTools
+	assert.ok(options.hiddenTools.includes("web_search"), "unrouted tools must be added to hiddenTools");
 });
 
 test.after(() => rmSync(testHome, { recursive: true, force: true }));
