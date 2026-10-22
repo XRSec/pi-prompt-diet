@@ -1,9 +1,9 @@
-# 🥗 pi-prompt-diet (提示词军师 & 任务契约中枢)
+# 🥗 pi-prompt-diet
 
-> **从单纯的提示词去脂，升级为 AI Agent 的前置消息整理、任务行为契约（Task Contract）与动态能力调度中枢**  
-> *Next-generation Pre-flight Intent Analysis, Task Contract Architecture, Prompt Cache Protection, and Dynamic Soft Routing for [Pi Coding Agent](https://github.com/earendil-works/pi).*
+> **Pi Coding Agent 的轻量前置意图预检、任务契约与 Prompt Cache 保护插件**  
+> *Lean Pre-flight Intent Analysis, Task Contract Guard, Prompt Cache Protection, and Soft Routing for [Pi Coding Agent](https://github.com/earendil-works/pi).*
 
-[English Documentation](#english) | [中文说明](#中文说明) | [Pi 扩展开发与调试指南 (反重力 IDE 专用)](#pi-debug-guide)
+[English Documentation](#english) | [中文说明](#中文说明) | [调试指南](#pi-debug-guide)
 
 ---
 
@@ -11,85 +11,61 @@
 
 ## 🇬🇧 English Documentation
 
-### 🚀 The Evolution: Beyond Token Trimming
+### ⚡ Practical Purpose: Stop Agent Guesswork & Rogue Edits
 
-Initially, `pi-prompt-diet` was conceived as a context slimmer to prevent guideline bloat. However, in real-world multi-turn agent operations, a deeper bottleneck emerged:
-> **Most coding agents act like headless chickens**—misinterpreting colloquial commands, hallucinating user typos into code changes, over-engineering read-only queries with rogue file edits, and polluting context windows with thousands of tokens of historical tool logs.
+In multi-turn coding sessions, agents frequently fail for simple, predictable reasons:
+1. **Misinterpreting Intent**: Treating casual questions ("why does this crash?") as requests to immediately rewrite codebase files.
+2. **Typo Hallucination**: Seeing a user's accidental typo (e.g. `dcoment`) and guessing wrong, or seeing a legitimate package name (e.g. `nowledge-mem`) and treating it as a typo.
+3. **Context Inflation & Cache Busting**: Continuously mutating the System Prompt, which wipes out model prompt caches (95%+ discounts lost) and drives up latency and API costs.
+4. **Historical Tool Log Dilution**: Giant diffs and tool logs from 5 turns ago linger in context, diluting the model's focus on the actual problem.
 
-Unless users rely on ultra-expensive flagship models at 20x pricing tiers, mainstream models quickly lose alignment across long multi-turn sessions.
-
-Today, `pi-prompt-diet` has evolved into a full-fledged **Pre-flight Task Contract Architect & Capability Dispatcher**. It acts as an intelligent triage gateway between the human user and the primary agent model.
+`pi-prompt-diet` is a **lean, lightweight pre-flight gatekeeper** that intercepts messages *before* the main model runs.
 
 ---
 
-### 💡 Core Architecture & The Pre-flight Control Plane
+### 💡 How It Works
 
 ```
-                         ┌──────────────────────────────────────────────┐
-                         │      User Prompt & Multi-turn History        │
-                         │  (Elastic History Depth + Nowledge Mem Bundle)│
-                         └──────────────────────┬───────────────────────┘
-                                                │
-                     Pre-flight Task Contract   │ (cpa/gemini-3.5-flash-lite / Haiku)
-                     Intent Analysis (< 400ms)  ▼
-                         ┌──────────────────────────────────────────────┐
-                         │   1. Task Contract & Disambiguation Engine   │
-                         │   • Intent: analytical / execution / composite│
-                         │   • allow_write: strict permission barrier    │
-                         │   • clarified_intent: normalized user goal   │
-                         │   • typo_corrections: auto-heals slips        │
-                         │   • protected_terms: domain jargon defense   │
-                         │   • focus_tools & focus_skills: soft routing │
-                         └──────────────────────┬───────────────────────┘
-                                                │
-                     Zero-Cache-Cost Injection  │ <system_directive> tag
-                                                ▼
-                         ┌──────────────────────────────────────────────┐
-                         │   2. User Message Decoration                 │
-                         │   • Injected strictly at top of User message │
-                         │   • System Prompt remains 100% static        │
-                         │   • Historical tool output scrubbing         │
-                         └──────────────────────┬───────────────────────┘
-                                                │
-                                                ▼
-                         ┌──────────────────────────────────────────────┐
-                         │   3. Main LLM (Gemini 3.8 / Claude 3.7 / ...)│
-                         │   • 95% - 99% Prompt Cache Hit Rate          │
-                         │   • Clear operational boundaries (No rogue   │
-                         │     file edits on read-only tasks)           │
-                         │   • High-focus tool & skill attention        │
-                         │   • On-demand dynamic lazy dispatching       │
-                         └──────────────────────────────────────────────┘
+[ User Input & Recent History ]
+             │
+             ▼ (< 400ms Pre-flight via lightweight model, e.g. Flash-Lite / Haiku)
+┌──────────────────────────────────────────────┐
+│  Pre-flight Task Contract                    │
+│  • Task Mode: analytical (read-only) vs      │
+│               execution (write-allowed)      │
+│  • clarified_intent: normalized user goal    │
+│  • typo_corrections & protected_terms        │
+│  • focus_tools & focus_skills (soft routing) │
+└──────────────────────┬───────────────────────┘
+                       │
+                       ▼ (<system_directive> injected at TOP of User Message)
+┌──────────────────────────────────────────────┐
+│  Primary Agent Model (Gemini / Claude / etc) │
+│  • 100% Static System Prompt (Cache Hit 95%+)│
+│  • Hard barrier: No edits during inspection  │
+│  • Historical tool outputs auto-scrubbed     │
+└──────────────────────────────────────────────┘
 ```
 
 ---
 
-### ✨ Key Features
+### 🛠️ Core Capabilities
 
-#### 1. Elastic Multi-Turn Context & Disambiguation
-* **Elastic History Window**: Dynamically extracts 4 to 6 recent messages (2~3 turns) balanced against current prompt length to resolve pronouns, ellipsis, and contextual drift.
-* **Nowledge Mem Bundle Integration**: Automatically pulls persistent cross-session knowledge and memory preferences into pre-flight analysis.
-* **Clarified Operational Intent (`clarified_intent`)**: Transforms fragmented, colloquial, or ambiguous user inputs into a structured, executable specification in the user's native language.
-
-#### 2. Strict Task Contract & Permission Guard (`allow_write`)
-* **Analytical Tasks**: When inspecting, checking, reviewing, or asking questions ("为什么报错", "检查这个逻辑"), `allow_write` is strictly locked to `false`. The primary model is explicitly barred from making unexpected code modifications.
-* **Execution Tasks**: Modification, script execution, or scraping tasks unlock write privileges deterministically.
-* **Direct Script Prioritization**: Recognizes CLI script invocations (e.g. `@ego-script/run.mjs`) as black-box executions rather than code-reading requests.
-
-#### 3. Typo Self-Healing & Domain Jargon Defense
-* **Typo Corrections**: Automatically detects and heals accidental typing slips and phonetically mistyped terms before the main model sees them.
-* **Protected Terms Barrier**: Identifies package names, repo identifiers, and proprietary abbreviations (e.g. `nowledge-mem`, `pi-hashline-edit-pro`), forbidding the main model from treating them as errors or misspellings.
-
-#### 4. Absolute Prompt Cache Protection (`<system_directive>`)
-* **Zero System Prompt Mutation**: Modifying the System Prompt invalidates prompt cache and drives up cost and TTFT. `pi-prompt-diet` keeps the System Prompt baseline completely static.
-* **User-Side Directive Injection**: Injects routing contracts and capability guidance cleanly inside `<system_directive>...</system_directive>` prefixes at the very top of the user turn during the `context` lifecycle event.
-
-#### 5. Historical Tool Output Scrubbing
-* Automatically scrubs past large file reads, long command outputs, and bloated diffs in long multi-turn sessions down to concise summaries, freeing up thousands of tokens of attention for the active task.
-
-#### 6. Resilient 0ms Bypass & Fail-Open
-* **Zero-Latency Bypass**: Common affirmations and continuation words (`好的`, `continue`, `go ahead`) bypass pre-flight API calls entirely.
-* **Fail-Open Fallback**: Network hiccups, timeouts, or authentication errors automatically release all capabilities, preventing execution deadlocks.
+* **Strict Task Contract & Permission Guard (`allow_write`)**:
+  * `analytical`: When asked to review, inspect, investigate, or explain code, `allow_write` is locked to `false`. The model is forbidden from touching source files.
+  * `execution`: Only explicitly modification/script/collection tasks unlock file editing.
+* **Intent Clarification (`clarified_intent`)**:
+  * Extracts the core goal from ambiguous, colloquial, or ellipsis-heavy multi-turn inputs into a clean operational statement.
+* **Typo Self-Healing & Protected Terms Barrier**:
+  * Automatically corrects typing slips.
+  * Flags proprietary packages, tool names, and variables as `protected_terms`, strictly preventing the model from hallucinating them as misspellings.
+* **Zero-Cost Prompt Cache Preservation**:
+  * The System Prompt remains completely static. Directives are injected only as `<system_directive>` inside the incoming User turn during the `context` lifecycle event.
+* **Historical Tool Scrubbing**:
+  * Automatically condenses bloated historical tool outputs (large file dumps, giant diffs) in long sessions, preserving attention tokens.
+* **0ms Bypass & Fail-Open**:
+  * Fast bypass for simple confirmation words (`continue`, `ok`, `好的`).
+  * Instant fail-open on any pre-flight error to never stall work.
 
 ---
 
@@ -97,68 +73,50 @@ Today, `pi-prompt-diet` has evolved into a full-fledged **Pre-flight Task Contra
 
 ## 🇨🇳 中文说明
 
-### 🚀 架构跃迁：从“提示词去脂”到“意图契约与软路由中枢”
+### ⚡ 为什么做这个插件？（务实去虚）
 
-在最初的设计中，`pi-prompt-diet` 主要用于精简 Pi 扩展累加的庞大 Guidelines，为系统提示词“去脂”。但在高强度的多轮工程实战中，我们发现 Agent 体验的最大杀手往往不是 Token 多了几千，而是：
-> **主模型像无头苍蝇一样乱撞——理解错口语意图、把用户手滑打的错别字当真、在只读巡检任务中私自乱改源文件，并在多轮交互中被巨型的历史工具输出严重稀释注意力。**
+在多轮编程开发中，大部分失控并不是因为模型参数不够大，而是因为缺少最基础的前置拦截约束：
+1. **意图跑偏与擅自改动**：用户只是随口问一句“帮我看看这个报错怎么回事”，模型直接自作主张把几十行代码全改了；
+2. **错别字误导与专有名词误伤**：用户手滑打错一个字母，模型当真并展开灾难性脑补；或者用户提到一个冷门包名（如 `nowledge-mem`），模型自作聪明去给它“纠错”；
+3. **缓存击穿与账单暴涨**：很多方案动态改写 System Prompt，直接击穿各大模型 95%+ 的 Prompt Cache 缓存折扣，不仅卡顿还费钱；
+4. **历史脏数据稀释注意力**：跑了几轮之后，前面巨长的大文件读取、diff 垃圾一直堆在上下文里，把模型注意力冲得一干二净。
 
-除非使用极其昂贵、拥有超大思维链的顶级主力模型，否则中轻量模型极易在多轮交互中翻车失焦。
-
-因此，现在的 `pi-prompt-diet` 已经全面升级为 **AI Agent 的前置消息整理、任务契约（Task Contract）架构与动态能力调度中枢**。在用户的输入到达昂贵的主模型之前，由轻量极速模型完成“分诊打标、错字自愈、意图清洗、能力分拣与权限锁死”。
+`pi-prompt-diet` 去除了所有花哨的架子，做的事情非常聚焦：**在用户消息发出后、主模型动手前，做一层轻巧的“意图整理、权限卡死、错字校正与缓存保护”**。
 
 ---
 
-### 💡 核心运转机制与流水线
+### 💡 核心机制
 
-#### 1. 弹性多轮上下文感知与意图重整 (Elastic History & Disambiguation)
-* **弹性多轮感知**：根据当前用户输入的长度，自适应提取最近 **4~6 条消息（2~3 轮会话）**，配合头尾截取算法（保留头部初始意图与尾部最新报错/补充），彻底消除代词指代歧义（如“刚才那个报错怎么修”）。
-* **Nowledge Mem 记忆联动**：自动感知系统提示词中的 `Nowledge Mem Context Bundle`，当检测到“再次/复现/重跑/像上次一样”等需求时，自动激活记忆检索工具。
-* **意图规范化提炼 (`clarified_intent`)**：将用户随意、口语化甚至省略主干的消息，规范翻译为机器可精准执行的标准操作需求。
+#### 1. 任务契约与只读权限硬锁 (`Task Contract`)
+* **`analytical`（只读巡检）**：只要识别出用户只是在“检查”、“看代码”、“分析报错”、“review”，强行锁死 **`allow_write: false`**。主模型被物理剥夺修改业务源码的权限，只能直接汇报分析结论；
+* **`execution`（任务执行）**：涉及明确的代码实现、脚本运行或数据抓取时，放行写权限。
 
-#### 2. 任务契约与权限锁死 (`Task Contract & allow_write`)
-系统为每一轮交互建立严格的任务行为契约：
-* **`analytical`（纯分析/只读）**：用户只是“看代码”、“查 bug”、“为什么报错”时，权限强行锁死为 **`allow_write: false`**。严禁主模型越权修改任何业务源码！
-* **`execution`（执行任务）**：涉及改代码、跑脚本、爬取数据时，才放行写权限。
-* **脚本黑盒直通**：识别 `@ego-script/xxx.mjs` 等脚本调用语法，指示模型直接黑盒运行，禁止盲目通读百行源码。
+#### 2. 意图提炼与多轮消歧 (`clarified_intent`)
+* 结合最近 2~3 轮会话，把用户口语化、含糊不清、缺少主语的输入，翻译成标准规范的真实意图需求。
 
-#### 3. 错别字自愈与领域专有名词保护 (`typo_corrections` & `protected_terms`)
-* **错别字自动纠偏**：识别并修正用户手滑敲错的词（如把 `dcoment` 纠正为 `document`）。
-* **专有术语隔离防护**：自动提取专属包名、代码标识符（如 `nowledge-mem`、`pi-hashline-edit-pro`、自定义类名），打上保护标记，**严令主模型绝不允许将其视为错别字**。
+#### 3. 错别字自愈与专有术语保护 (`protected_terms`)
+* 自动识别用户的拼写手滑；
+* 提取命令里的包名、文件名、代码标识符，打上保护标记，明确命令主模型**绝不允许当成拼写错误**。
 
 #### 4. 零成本 Prompt Cache 软注入 (`<system_directive>`)
-* **拒绝击穿 Prompt Cache**：坚决不在会话中动态改写 System Prompt，确保吃满大模型 **95% ~ 99% 的系统级缓存折扣**，大幅压降延迟与费用。
-* **User 顶部无感软引导**：在 `context` 生命周期中，将任务契约以 `<system_directive>` 标签直接注入在当轮用户消息的最上方，以极小成本指引主模型注意力。
+* **不碰静态 System Prompt**：确保吃满大模型 95%~99% 的 Prompt Cache 命中率；
+* **挂载在 User 消息顶端**：在 `context` 阶段，将任务契约以 `<system_directive>` 标签注入在当轮用户消息的顶部引导注意力。
 
-#### 5. 历史工具结果智能脱水 (Historical Tool Scrubbing)
-在长会话中，历史工具产生的大段日志、全文读取和巨型 diff 会持续占满注意力。插件在 `context` 阶段对历史轮次的工具输出执行脱水压缩（仅保留头尾摘要），释放数千字符的干净上下文。
+#### 5. 历史工具结果智能脱水 (Tool Result Scrubbing)
+* 自动压缩前面轮次遗留的冗长工具返回值（巨型日志、全文件内容、长 diff），仅保留头尾摘要，释放干净上下文。
 
-#### 6. 0ms 旁路直通与 Fail-Open 容灾
-* **纯确认词 0ms 旁路**：对 `好的`、`继续`、`continue` 等词跳过分析模型调用，0 延迟直出；
-* **Fail-Open 熔断保障**：预检模型遇网络抖动或超时时，自动全量放行工具与 Skill，确保开发流程永不中断。
-
----
-
-### 🏛️ 生产级作战角色分工矩阵
-
-在现代 Agent 协同体系中，`pi-prompt-diet` 作为核心前哨，与主力模型及其他插件协同运转：
-
-| 角色 / 节点 | 载体 | 推荐模型 | 核心职责 |
-| :--- | :--- | :--- | :--- |
-| **Commander (指挥官)** | **User** | 人类工程师 | 提出业务需求、确认方案、做关键决策与最终验收。 |
-| **Preflight Router (前哨分诊军师)** | **`pi-prompt-diet`** | `cpa/gemini-3.5-flash-lite` / `Haiku` | **前置意图重整、任务契约制定、错字修正、权限约束与能力软路由。** |
-| **Main Engine (主力工匠)** | **Main Model** | `gemini-3.8-flash` / `Claude 3.7` | 接收规范契约，在安全的权限和精准工具聚焦下专注高质量编码交付。 |
-| **Supervisor (纪律守卫)** | [**`pi-general`**](file:///Users/xr/.pi/agent/extensions/pi-general) | 状态机 + `gemini-3.8-flash` | 会话中连击熔断、只读探查限制与动作后验证闭环守卫。 |
-| **Specialized Subagents** | **`pi-subagents`** | `worker` / `reviewer` / `oracle` | 复杂任务拆分、代码审查与高阶架构推演。 |
+#### 6. 0ms 旁路与 Fail-Open 容灾
+* “好的”、“继续”、“continue” 等确认词直接 0ms 旁路跳过预检；
+* 预检超时或模型调用异常时，自动全量放行（Fail-Open），绝不阻断流程。
 
 ---
 
-### ⚙️ 配置文件说明 (`pi-prompt-diet.json`)
+### ⚙️ 配置说明 (`pi-prompt-diet.json`)
 
-配置文件支持全局路径 `~/.pi/agent/pi-prompt-diet.json` 或项目级 `.pi/pi-prompt-diet.json`：
+配置文件位于 `~/.pi/agent/pi-prompt-diet.json` 或项目级 `.pi/pi-prompt-diet.json`：
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/XRSec/pi-prompt-diet/main/schema.json",
   "enabled": true,
   "guidelines": {
     "mode": "slim"
@@ -173,8 +131,7 @@ Today, `pi-prompt-diet` has evolved into a full-fledged **Pre-flight Task Contra
     "preflightModel": "cpa/gemini-3.5-flash-lite",
     "distillSkills": true,
     "distillToolGuidelines": true
-  },
-  "packages": []
+  }
 }
 ```
 
@@ -182,18 +139,16 @@ Today, `pi-prompt-diet` has evolved into a full-fledged **Pre-flight Task Contra
 
 <a name="pi-debug-guide"></a>
 
-## 🛠️ Pi 扩展开发与调试指南 (反重力 IDE 专用)
-
-在反重力 IDE (Antigravity) 或本地终端进行插件二次开发时：
+## 🛠️ 快速测试与验证
 
 ```bash
-# 1. 快速命令行单次验证
+# 1. 单次执行测试
 pi -p "帮我查看一下当前的 git 状态"
 
-# 2. 临时加载本地扩展进行测试
+# 2. 临时加载本地扩展
 pi -e ./index.ts -p "测试前置契约与软路由"
 
-# 3. 运行自动化单元测试套件 (覆盖 Task Contract、Fail-Open、Head-Tail 截取)
+# 3. 运行自动化单元测试套件
 npm test
 ```
 
